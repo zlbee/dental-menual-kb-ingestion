@@ -1,0 +1,8 @@
+/data
+/models
+.env
+/.venv
+/.deps
+/pdf_paths.txt
+__pycache__/
+*.pyc
