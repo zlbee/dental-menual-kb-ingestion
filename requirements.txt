@@ -1,0 +1,4 @@
+# Phase 01 direct dependencies.
+# We keep this intentionally small for the first Dockerized run:
+# - `marker-pdf` provides Marker, PyTorch, and the document conversion stack.
+marker-pdf==1.10.2

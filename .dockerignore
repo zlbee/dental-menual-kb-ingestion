@@ -1,0 +1,10 @@
+.git
+.gitignore
+.env
+.venv
+.deps
+__pycache__
+*.pyc
+data
+models
+pdf_paths.txt
