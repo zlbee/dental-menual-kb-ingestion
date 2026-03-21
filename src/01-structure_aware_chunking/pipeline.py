@@ -18,7 +18,7 @@ from typing import Any, Iterable
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data" / "processed" / "01_structure_aware"
 DEFAULT_MARKER_EXECUTABLE = "marker_single"
-DEFAULT_LLM_SERVICE = "marker.services.gemini.GoogleGeminiService"
+DEFAULT_LLM_SERVICE = "marker.services.openai.OpenAIService"
 
 TEXTUAL_BLOCK_TYPES = {
     "Caption",

@@ -39,13 +39,17 @@ RUN pip install -r /app/requirements.txt
 
 ### 2. Typical sample run
 
+The image installs dependencies once, then we bind-mount the host `src/` into the
+container so Python code changes are picked up immediately without rebuilding.
+
 Once dependency installation is enabled in the image:
 
 ```powershell
 docker build -t dental-kb-ingestion .
 docker run --rm `
   --env-file .env `
-  -v "${PWD}:/app" `
+  -v "${PWD}/src:/app/src" `
+  -v "${PWD}/data:/app/data" `
   dental-kb-ingestion `
   python src/01-structure_aware_chunking/pipeline.py `
     --input-pdf data/raw/ManualClinProcDentistry-Sample.pdf
@@ -66,7 +70,8 @@ If the source PDF lives outside this repository, mount that parent folder explic
 ```powershell
 docker run --rm `
   --env-file .env `
-  -v "${PWD}:/app" `
+  -v "${PWD}/src:/app/src" `
+  -v "${PWD}/data:/app/data" `
   -v "C:/path/to/external-pdfs:/external-data:ro" `
   dental-kb-ingestion `
   python src/01-structure_aware_chunking/pipeline.py `
@@ -77,5 +82,6 @@ docker run --rm `
 
 - The script now defaults to Marker `--use_llm` with `marker.services.gemini.GoogleGeminiService`.
 - `.env` values like `GEMINI_API_KEY` and optional `GEMINI_MODEL_NAME` are forwarded to the Marker CLI automatically.
+- `compose.yaml` mounts host `src/` and `data/` into `/app`, so code changes do not require rebuilding the image.
 - If you want to force OpenAI-compatible routing again, pass `--llm-service marker.services.openai.OpenAIService`.
 - If Marker JSON is unavailable or unexpectedly shaped, the script falls back to a markdown-based parser so we still get phase-01 outputs.

@@ -11,5 +11,7 @@ services:
       - .env
     working_dir: /app
     volumes:
-      - .:/app
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./.cache/datalab:/root/.cache/datalab
     command: python src/01-structure_aware_chunking/pipeline.py --help
