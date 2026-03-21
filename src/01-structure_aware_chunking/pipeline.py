@@ -11,6 +11,8 @@ import os
 import re
 import shlex
 import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -75,6 +77,7 @@ class PipelineConfig:
     marker_executable: str
     llm_service: str
     use_llm: bool
+    emit_json: bool
     disable_image_extraction: bool
     paginate_output: bool
     page_range: str | None
@@ -129,6 +132,11 @@ def parse_args() -> PipelineConfig:
         help="Enable Marker hybrid mode with --use_llm. Defaults to on.",
     )
     parser.add_argument(
+        "--emit-json",
+        action="store_true",
+        help="Also render Marker JSON in addition to markdown. Defaults to markdown only.",
+    )
+    parser.add_argument(
         "--disable-image-extraction",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -171,6 +179,7 @@ def parse_args() -> PipelineConfig:
         marker_executable=parsed.marker_executable,
         llm_service=parsed.llm_service,
         use_llm=parsed.use_llm,
+        emit_json=parsed.emit_json,
         disable_image_extraction=parsed.disable_image_extraction,
         paginate_output=parsed.paginate_output,
         page_range=parsed.page_range,
@@ -340,27 +349,79 @@ def run_marker_render(
 ) -> tuple[Path, str]:
     render_dir = ensure_dir(artifacts_dir / output_format)
     preferred_stems = [cfg.input_pdf.stem, cfg.doc_id]
+    stdout_log_path = render_dir / "marker.stdout.log"
+    stderr_log_path = render_dir / "marker.stderr.log"
 
     if not cfg.force:
         try:
             existing = find_primary_artifact(render_dir, output_format, preferred_stems)
+            print(
+                f"[phase01] Reusing existing Marker {output_format} artifact: {existing}",
+                file=sys.stderr,
+                flush=True,
+            )
             return existing, "skipped_existing"
         except FileNotFoundError:
             pass
 
     command = build_marker_command(cfg, render_dir, output_format, env_values)
-    completed = subprocess.run(
+    print(
+        f"[phase01] Running Marker for {output_format} output...",
+        file=sys.stderr,
+        flush=True,
+    )
+    process = subprocess.Popen(
         command,
-        check=True,
         env=merged_env(env_values),
         cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    artifact = find_primary_artifact(render_dir, output_format, preferred_stems)
+    assert process.stdout is not None
+    assert process.stderr is not None
 
-    (render_dir / "marker.stdout.log").write_text(completed.stdout or "", encoding="utf-8")
-    (render_dir / "marker.stderr.log").write_text(completed.stderr or "", encoding="utf-8")
+    def tee_pipe(pipe: Any, log_path: Path) -> None:
+        with log_path.open("wb") as log_handle:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                log_handle.write(chunk)
+                log_handle.flush()
+                sink = getattr(sys.stderr, "buffer", None)
+                if sink is not None:
+                    sink.write(chunk)
+                    sink.flush()
+                else:
+                    sys.stderr.write(chunk.decode("utf-8", errors="replace"))
+                    sys.stderr.flush()
+        pipe.close()
+
+    stdout_thread = threading.Thread(
+        target=tee_pipe,
+        args=(process.stdout, stdout_log_path),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=tee_pipe,
+        args=(process.stderr, stderr_log_path),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    return_code = process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    if return_code != 0:
+        raise subprocess.CalledProcessError(return_code, redact_command(command))
+
+    artifact = find_primary_artifact(render_dir, output_format, preferred_stems)
+    print(
+        f"[phase01] Marker {output_format} output is ready: {artifact}",
+        file=sys.stderr,
+        flush=True,
+    )
     return artifact, redact_command(command)
 
 
@@ -802,7 +863,10 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
     if not cfg.input_pdf.exists():
         raise FileNotFoundError(f"Input PDF does not exist: {cfg.input_pdf}")
 
-    env_values = load_simple_env(cfg.env_file)
+    print(f"[phase01] Starting pipeline for {cfg.input_pdf}", file=sys.stderr, flush=True)
+    # Prefer explicitly loaded .env values, but also honor environment variables
+    # already injected by Docker Compose or the parent shell.
+    env_values = merged_env(load_simple_env(cfg.env_file))
 
     base_output = ensure_dir(cfg.output_root)
     manifests_dir = ensure_dir(base_output / "manifests")
@@ -816,19 +880,36 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
         env_values=env_values,
         artifacts_dir=marker_raw_dir,
     )
-    json_artifact, json_command = run_marker_render(
-        cfg=cfg,
-        output_format="json",
-        env_values=env_values,
-        artifacts_dir=marker_raw_dir,
-    )
+    normalized_source = "markdown"
+    json_artifact: Path | None = None
+    json_command: str | None = None
+    marker_metadata: dict[str, Any] = {}
 
-    marker_payload = read_json(json_artifact)
-    normalized_blocks, marker_metadata = flatten_marker_json_to_normalized_blocks(marker_payload)
-    if not normalized_blocks:
-        fallback_markdown = markdown_artifact.read_text(encoding="utf-8")
-        normalized_blocks = normalize_markdown_headings(fallback_markdown)
+    print("[phase01] Normalizing markdown output...", file=sys.stderr, flush=True)
+    fallback_markdown = markdown_artifact.read_text(encoding="utf-8")
+    normalized_blocks = normalize_markdown_headings(fallback_markdown)
 
+    if cfg.emit_json:
+        json_artifact, json_command = run_marker_render(
+            cfg=cfg,
+            output_format="json",
+            env_values=env_values,
+            artifacts_dir=marker_raw_dir,
+        )
+        print("[phase01] Normalizing Marker JSON output...", file=sys.stderr, flush=True)
+        marker_payload = read_json(json_artifact)
+        json_normalized_blocks, marker_metadata = flatten_marker_json_to_normalized_blocks(marker_payload)
+        if json_normalized_blocks:
+            normalized_blocks = json_normalized_blocks
+            normalized_source = "json"
+        else:
+            print(
+                "[phase01] Marker JSON had no usable blocks, keeping markdown normalization...",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    print("[phase01] Building structural chunks...", file=sys.stderr, flush=True)
     structural_chunks = build_structural_chunks(cfg.doc_id, normalized_blocks)
 
     normalized_path = normalized_dir / f"{cfg.doc_id}.jsonl"
@@ -846,11 +927,13 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
         "processed_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "marker": {
             "markdown_artifact": str(markdown_artifact),
-            "json_artifact": str(json_artifact),
+            "json_artifact": str(json_artifact) if json_artifact else None,
             "markdown_command": markdown_command,
             "json_command": json_command,
             "use_llm": cfg.use_llm,
             "llm_service": cfg.llm_service if cfg.use_llm else None,
+            "emit_json": cfg.emit_json,
+            "normalization_source": normalized_source,
             "paginate_output": cfg.paginate_output,
             "disable_image_extraction": cfg.disable_image_extraction,
             "page_range": cfg.page_range,
@@ -867,6 +950,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
         },
         "marker_metadata": marker_metadata,
     }
+    print("[phase01] Writing manifest and chunk artifacts...", file=sys.stderr, flush=True)
     write_json(manifest_path, manifest)
     return manifest
 

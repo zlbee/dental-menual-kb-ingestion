@@ -8,20 +8,17 @@ Running `pipeline.py` writes:
 
 - `data/processed/01_structure_aware/manifests/<doc_id>.json`
 - `data/processed/01_structure_aware/marker_raw/<doc_id>/markdown/...`
-- `data/processed/01_structure_aware/marker_raw/<doc_id>/json/...`
+- `data/processed/01_structure_aware/marker_raw/<doc_id>/json/...` when `--emit-json` is enabled
 - `data/processed/01_structure_aware/normalized_blocks/<doc_id>.jsonl`
 - `data/processed/01_structure_aware/structural_chunks/<doc_id>.jsonl`
 
 ## What It Does
 
-1. Calls `marker_single` twice for the same PDF:
-   - once for `markdown`
-   - once for `json`
-2. Uses Marker JSON as the primary structured source.
-3. Rebuilds `heading_path` from `section_hierarchy`.
+1. Calls `marker_single` once for `markdown` by default.
+2. If `--emit-json` is enabled, it also renders `json` and prefers JSON-derived normalization when usable.
+3. Rebuilds `heading_path` from `section_hierarchy` when JSON output is available.
 4. Filters out page headers/footers and keeps meaningful blocks like text, lists, tables, captions, and table-of-contents blocks.
 5. Emits phase-01 structural chunks without worrying about overlong sections yet. Long sections are intentionally deferred to phase 02 semantic chunking.
-6. Defaults to Marker's Gemini service, while still allowing an explicit switch back to OpenAI if needed.
 
 ## Docker Workflow
 
@@ -63,6 +60,15 @@ docker compose run --rm phase01 `
     --input-pdf data/raw/ManualClinProcDentistry-Sample.pdf
 ```
 
+To also persist Marker JSON for the same run:
+
+```powershell
+docker compose run --rm phase01 `
+  python src/01-structure_aware_chunking/pipeline.py `
+    --input-pdf data/raw/ManualClinProcDentistry-Sample.pdf `
+    --emit-json
+```
+
 ### 3. Running a PDF outside the workspace
 
 If the source PDF lives outside this repository, mount that parent folder explicitly and pass the in-container path:
@@ -80,8 +86,9 @@ docker run --rm `
 
 ## Notes
 
-- The script now defaults to Marker `--use_llm` with `marker.services.gemini.GoogleGeminiService`.
-- `.env` values like `GEMINI_API_KEY` and optional `GEMINI_MODEL_NAME` are forwarded to the Marker CLI automatically.
+- The script renders markdown by default. Pass `--emit-json` if you also want Marker JSON artifacts and JSON-based normalization.
+- The script now defaults to Marker `--use_llm` with `marker.services.openai.OpenAIService`.
+- `.env` values like `OPENAI_API_KEY`, `OPENAI_MODEL`, and optional `OPENAI_BASE_URL` are forwarded to the Marker CLI automatically.
 - `compose.yaml` mounts host `src/` and `data/` into `/app`, so code changes do not require rebuilding the image.
-- If you want to force OpenAI-compatible routing again, pass `--llm-service marker.services.openai.OpenAIService`.
-- If Marker JSON is unavailable or unexpectedly shaped, the script falls back to a markdown-based parser so we still get phase-01 outputs.
+- If you want to switch to Gemini routing, pass `--llm-service marker.services.gemini.GoogleGeminiService` and provide the matching Gemini credentials in `.env`.
+- If Marker JSON is unavailable or unexpectedly shaped, the script keeps the markdown-based normalization so we still get phase-01 outputs.
