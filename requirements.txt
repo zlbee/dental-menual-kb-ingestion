@@ -2,3 +2,11 @@
 # We keep this intentionally small for the first Dockerized run:
 # - `marker-pdf` provides Marker, PyTorch, and the document conversion stack.
 marker-pdf==1.10.2
+# Phase 02 uses a pinned LangChain trio to avoid resolver conflicts:
+# - `langchain-experimental==0.4.1` expects the newer community/core stack.
+# - `langchain-openai==0.3.34` still fits Marker's transitive `openai<2` cap.
+# - `langchain-text-splitters==1.1.1` matches `langchain-classic 1.0.x`.
+langchain-experimental==0.4.1
+langchain-openai==0.3.34
+langchain-text-splitters==1.1.1
+tiktoken>=0.7,<1.0
