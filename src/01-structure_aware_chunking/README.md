@@ -69,6 +69,20 @@ docker compose run --rm phase01 `
     --emit-json
 ```
 
+To opt into resumable segmented Marker runs, process the PDF in fixed-size page
+batches:
+
+```powershell
+docker compose run --rm phase01 `
+  python src/01-structure_aware_chunking/pipeline.py `
+    --input-pdf data/raw/ManualClinProcDentistry-Sample.pdf `
+    --segment-pages 10
+```
+
+Completed page batches are cached on the host under
+`.cache/datalab/phase01/...` through the existing Compose volume mount, so a
+later rerun can skip finished batches and continue from the missing ones.
+
 ### 3. Running a PDF outside the workspace
 
 If the source PDF lives outside this repository, mount that parent folder explicitly and pass the in-container path:
@@ -90,5 +104,7 @@ docker run --rm `
 - The script now defaults to Marker `--use_llm` with `marker.services.openai.OpenAIService`.
 - `.env` values like `OPENAI_API_KEY`, `OPENAI_MODEL`, and optional `OPENAI_BASE_URL` are forwarded to the Marker CLI automatically.
 - `compose.yaml` mounts host `src/` and `data/` into `/app`, so code changes do not require rebuilding the image.
+- `--segment-pages` is an explicit opt-in recovery mode. It runs Marker in page batches and reassembles the final artifact afterwards. This improves resumability, but the final output can differ slightly from a single full-document Marker run, especially near segment boundaries or for cross-page table/header inference.
+- Segmented runs currently require `--disable-image-extraction` to stay enabled. That is already the default in this repository.
 - If you want to switch to Gemini routing, pass `--llm-service marker.services.gemini.GoogleGeminiService` and provide the matching Gemini credentials in `.env`.
 - If Marker JSON is unavailable or unexpectedly shaped, the script keeps the markdown-based normalization so we still get phase-01 outputs.
