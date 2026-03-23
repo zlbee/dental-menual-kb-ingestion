@@ -83,6 +83,7 @@ class PipelineConfig:
     disable_image_extraction: bool
     paginate_output: bool
     page_range: str | None
+    segment_by_outline: bool
     segment_pages: int | None
     force: bool
     debug: bool
@@ -158,13 +159,23 @@ def parse_args() -> PipelineConfig:
         help="Optional Marker page range, for example 0,5-10,20.",
     )
     parser.add_argument(
+        "--segment-by-outline",
+        action="store_true",
+        help=(
+            "Optional opt-in segmented Marker mode that first reads the PDF outline/"
+            "table-of-contents entries and uses them as segment boundaries. Combine "
+            "with --segment-pages to further split very large outline sections."
+        ),
+    )
+    parser.add_argument(
         "--segment-pages",
         type=int,
         default=None,
         help=(
             "Optional opt-in segmented Marker mode. Process the selected pages in "
-            "fixed-size page batches and reuse completed batches from cache on reruns. "
-            "This may slightly change results near segment boundaries."
+            "fixed-size page batches, or further split outline-based batches when "
+            "--segment-by-outline is enabled. This may slightly change results near "
+            "segment boundaries."
         ),
     )
     parser.add_argument(
@@ -198,6 +209,7 @@ def parse_args() -> PipelineConfig:
         disable_image_extraction=parsed.disable_image_extraction,
         paginate_output=parsed.paginate_output,
         page_range=parsed.page_range,
+        segment_by_outline=parsed.segment_by_outline,
         segment_pages=parsed.segment_pages,
         force=parsed.force,
         debug=parsed.debug,
@@ -370,7 +382,7 @@ def default_segment_cache_root() -> Path:
     return REPO_ROOT / ".cache" / "phase01"
 
 
-def get_pdf_page_count(pdf_path: Path) -> int:
+def load_pdf_reader_cls():
     reader_cls = None
     for module_name in ("pypdf", "PyPDF2"):
         try:
@@ -386,6 +398,11 @@ def get_pdf_page_count(pdf_path: Path) -> int:
             "count PDF pages before building page batches."
         )
 
+    return reader_cls
+
+
+def get_pdf_page_count(pdf_path: Path) -> int:
+    reader_cls = load_pdf_reader_cls()
     return len(reader_cls(str(pdf_path)).pages)
 
 
@@ -454,6 +471,283 @@ def resolve_requested_pages(cfg: PipelineConfig) -> tuple[list[int], int]:
     return list(range(total_pages)), total_pages
 
 
+def normalize_outline_title(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def load_outline_entries_with_pymupdf(pdf_path: Path) -> list[dict[str, Any]]:
+    module = None
+    for module_name in ("pymupdf", "fitz"):
+        try:
+            module = __import__(module_name)
+            break
+        except ImportError:
+            continue
+
+    if module is None:
+        raise ImportError("PyMuPDF is not available.")
+
+    entries: list[dict[str, Any]] = []
+    with module.open(str(pdf_path)) as document:
+        try:
+            toc_entries = document.get_toc(simple=True)
+        except TypeError:
+            toc_entries = document.get_toc()
+
+    for item in toc_entries or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 3:
+            continue
+        try:
+            level = int(item[0])
+            page_start = int(item[2]) - 1
+        except (TypeError, ValueError):
+            continue
+        title = normalize_outline_title(str(item[1] or ""))
+        if not title:
+            continue
+        entries.append(
+            {
+                "level": level,
+                "title": title,
+                "page_start": page_start,
+            }
+        )
+
+    return entries
+
+
+def load_outline_entries_with_pypdf(pdf_path: Path) -> list[dict[str, Any]]:
+    reader_cls = load_pdf_reader_cls()
+    reader = reader_cls(str(pdf_path))
+    raw_outline = getattr(reader, "outline", None)
+    if raw_outline is None:
+        raw_outline = getattr(reader, "outlines", None)
+    if raw_outline is None:
+        return []
+
+    entries: list[dict[str, Any]] = []
+
+    def walk(items: Any, level: int) -> None:
+        if isinstance(items, list):
+            for item in items:
+                walk(item, level)
+            return
+
+        if isinstance(items, tuple):
+            for item in items:
+                walk(item, level)
+            return
+
+        if isinstance(items, dict):
+            children = items.get("/Kids") or items.get("children")
+            title = normalize_outline_title(str(items.get("/Title") or items.get("title") or ""))
+            page_value = items.get("/Page")
+            page_start = None
+            if page_value is not None:
+                try:
+                    page_start = int(page_value)
+                except (TypeError, ValueError):
+                    page_start = None
+            if title and page_start is not None:
+                entries.append(
+                    {
+                        "level": level,
+                        "title": title,
+                        "page_start": page_start,
+                    }
+                )
+            if children:
+                walk(children, level + 1)
+            return
+
+        title = normalize_outline_title(str(getattr(items, "title", "") or ""))
+        if title:
+            try:
+                page_start = int(reader.get_destination_page_number(items))
+            except Exception:
+                page_start = None
+            if page_start is not None and page_start >= 0:
+                entries.append(
+                    {
+                        "level": level,
+                        "title": title,
+                        "page_start": page_start,
+                    }
+                )
+
+        nested = getattr(items, "children", None)
+        if nested:
+            walk(nested, level + 1)
+
+    walk(raw_outline, 1)
+    return entries
+
+
+def load_pdf_outline_entries(pdf_path: Path, total_pages: int) -> list[dict[str, Any]]:
+    loaders = (
+        load_outline_entries_with_pymupdf,
+        load_outline_entries_with_pypdf,
+    )
+    entries: list[dict[str, Any]] = []
+    for loader in loaders:
+        try:
+            entries = loader(pdf_path)
+            if entries:
+                break
+        except ImportError:
+            continue
+        except Exception:
+            continue
+
+    filtered = [
+        entry
+        for entry in entries
+        if 0 <= int(entry["page_start"]) < total_pages and str(entry["title"]).strip()
+    ]
+    filtered.sort(key=lambda entry: (int(entry["page_start"]), int(entry["level"])))
+    return filtered
+
+
+def build_fixed_page_batches(requested_pages: list[int], segment_pages: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "pages": page_group,
+            "segment_source": "pages",
+        }
+        for page_group in chunk_pages(requested_pages, segment_pages)
+    ]
+
+
+def build_outline_batches(
+    outline_entries: list[dict[str, Any]],
+    requested_pages: list[int],
+    segment_pages: int | None,
+) -> list[dict[str, Any]]:
+    if not requested_pages:
+        return []
+
+    requested_pages = sorted(set(requested_pages))
+    requested_min = requested_pages[0]
+    requested_max = requested_pages[-1]
+
+    entries_by_start: dict[int, list[dict[str, Any]]] = {}
+    for entry in outline_entries:
+        page_start = int(entry["page_start"])
+        if page_start < requested_min or page_start > requested_max:
+            continue
+        entries_by_start.setdefault(page_start, []).append(entry)
+
+    boundary_pages = sorted(entries_by_start)
+    if requested_min not in entries_by_start:
+        entries_by_start[requested_min] = [
+            {
+                "level": 0,
+                "title": "Front Matter",
+                "page_start": requested_min,
+            }
+        ]
+        boundary_pages = sorted(entries_by_start)
+
+    batches: list[dict[str, Any]] = []
+    requested_iter = iter(requested_pages)
+    current_page = next(requested_iter, None)
+
+    for index, start_page in enumerate(boundary_pages):
+        next_start = boundary_pages[index + 1] if index + 1 < len(boundary_pages) else requested_max + 1
+        span_pages: list[int] = []
+        while current_page is not None and current_page < next_start:
+            if current_page >= start_page:
+                span_pages.append(current_page)
+            current_page = next(requested_iter, None)
+
+        if not span_pages:
+            continue
+
+        source_entries = entries_by_start.get(start_page, [])
+        titles = [str(entry["title"]) for entry in source_entries]
+        levels = [int(entry["level"]) for entry in source_entries]
+        if segment_pages is not None and len(span_pages) > segment_pages:
+            for sub_pages in chunk_pages(span_pages, segment_pages):
+                batches.append(
+                    {
+                        "pages": sub_pages,
+                        "segment_source": "outline+pages",
+                        "outline_titles": titles,
+                        "outline_levels": levels,
+                        "outline_page_start": start_page,
+                    }
+                )
+            continue
+
+        batches.append(
+            {
+                "pages": span_pages,
+                "segment_source": "outline",
+                "outline_titles": titles,
+                "outline_levels": levels,
+                "outline_page_start": start_page,
+            }
+        )
+
+    return batches
+
+
+def resolve_segment_batches(cfg: PipelineConfig) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    requested_pages, total_pages = resolve_requested_pages(cfg)
+    if cfg.segment_by_outline:
+        outline_entries = load_pdf_outline_entries(cfg.input_pdf, total_pages)
+        outline_batches = build_outline_batches(
+            outline_entries=outline_entries,
+            requested_pages=requested_pages,
+            segment_pages=cfg.segment_pages,
+        )
+        if outline_batches:
+            return (
+                outline_batches,
+                {
+                    "segment_strategy": "outline",
+                    "outline_entry_count": len(outline_entries),
+                    "selected_page_count": len(requested_pages),
+                    "total_pdf_pages": total_pages,
+                },
+            )
+
+        if cfg.segment_pages is not None:
+            print(
+                (
+                    "[phase01] PDF outline was unavailable or unusable for the selected pages; "
+                    "falling back to fixed page batches."
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            return (
+                build_fixed_page_batches(requested_pages, cfg.segment_pages),
+                {
+                    "segment_strategy": "pages_fallback",
+                    "outline_entry_count": len(outline_entries),
+                    "selected_page_count": len(requested_pages),
+                    "total_pdf_pages": total_pages,
+                },
+            )
+
+        raise ValueError(
+            "Segmented outline mode was requested, but the PDF did not expose a usable outline."
+        )
+
+    if cfg.segment_pages is None:
+        raise ValueError("Fixed page segmentation requires --segment-pages.")
+
+    return (
+        build_fixed_page_batches(requested_pages, cfg.segment_pages),
+        {
+            "segment_strategy": "pages",
+            "selected_page_count": len(requested_pages),
+            "total_pdf_pages": total_pages,
+        },
+    )
+
+
 def build_segment_cache_fingerprint(
     cfg: PipelineConfig,
     env_values: dict[str, str],
@@ -481,6 +775,7 @@ def build_segment_cache_fingerprint(
         "disable_image_extraction": cfg.disable_image_extraction,
         "paginate_output": cfg.paginate_output,
         "page_range": cfg.page_range,
+        "segment_by_outline": cfg.segment_by_outline,
         "segment_pages": cfg.segment_pages,
         "debug": cfg.debug,
         "requested_pages": format_page_range_spec(requested_pages),
@@ -520,8 +815,13 @@ def assemble_segment_logs(
     ensure_dir(destination.parent)
     with destination.open("wb") as handle:
         for record in records:
+            label = ""
+            outline_titles = record.get("outline_titles") or []
+            if outline_titles:
+                label = f" outline={' / '.join(str(title) for title in outline_titles)}"
             header = (
                 f"===== {record['segment_name']} page_range={record['page_range']} "
+                f"source={record.get('segment_source', 'pages')}{label} "
                 f"artifact={record['artifact_path']} =====\n"
             ).encode("utf-8")
             handle.write(header)
@@ -654,16 +954,18 @@ def run_segmented_marker_render(
     artifacts_dir: Path,
     source_pdf_sha256: str,
 ) -> tuple[Path, str, dict[str, Any]]:
-    if cfg.segment_pages is None:
-        raise ValueError("Segmented Marker rendering requires cfg.segment_pages.")
+    if cfg.segment_pages is None and not cfg.segment_by_outline:
+        raise ValueError(
+            "Segmented Marker rendering requires --segment-pages or --segment-by-outline."
+        )
     if not cfg.disable_image_extraction:
         raise ValueError(
             "Segmented Marker mode currently requires --disable-image-extraction "
             "so the assembled markdown artifact does not end up with broken image paths."
         )
 
+    segment_batches, segmentation_meta = resolve_segment_batches(cfg)
     requested_pages, total_pages = resolve_requested_pages(cfg)
-    page_groups = chunk_pages(requested_pages, cfg.segment_pages)
     render_dir = ensure_dir(artifacts_dir / output_format)
     segmented_dir = ensure_dir(render_dir / SEGMENTED_ARTIFACT_DIRNAME)
     extension = ".md" if output_format == "markdown" else ".json"
@@ -688,7 +990,7 @@ def run_segmented_marker_render(
     print(
         (
             f"[phase01] Segmented Marker mode is enabled for {output_format}: "
-            f"{len(page_groups)} batches, up to {cfg.segment_pages} pages each. "
+            f"{len(segment_batches)} batches via {segmentation_meta['segment_strategy']}. "
             "This improves resumability but may slightly change boundary behavior "
             "compared with a single full-document Marker run."
         ),
@@ -697,7 +999,8 @@ def run_segmented_marker_render(
     )
 
     records: list[dict[str, Any]] = []
-    for segment_index, pages in enumerate(page_groups, start=1):
+    for segment_index, batch in enumerate(segment_batches, start=1):
+        pages = list(batch["pages"])
         page_range = format_page_range_spec(pages)
         segment_name = segment_name_for_pages(pages)
         segment_root = ensure_dir(cache_root / segment_name)
@@ -705,7 +1008,7 @@ def run_segmented_marker_render(
         if existing_record is not None:
             print(
                 (
-                    f"[phase01] Reusing completed segment {segment_index}/{len(page_groups)} "
+                    f"[phase01] Reusing completed segment {segment_index}/{len(segment_batches)} "
                     f"for {output_format}: {segment_name} ({page_range})"
                 ),
                 file=sys.stderr,
@@ -716,7 +1019,7 @@ def run_segmented_marker_render(
 
         print(
             (
-                f"[phase01] Rendering segment {segment_index}/{len(page_groups)} "
+                f"[phase01] Rendering segment {segment_index}/{len(segment_batches)} "
                 f"for {output_format}: {segment_name} ({page_range})"
             ),
             file=sys.stderr,
@@ -739,6 +1042,10 @@ def run_segmented_marker_render(
             "segment_index": segment_index,
             "page_range": page_range,
             "pages": pages,
+            "segment_source": str(batch["segment_source"]),
+            "outline_titles": list(batch.get("outline_titles") or []),
+            "outline_levels": list(batch.get("outline_levels") or []),
+            "outline_page_start": batch.get("outline_page_start"),
             "artifact_path": str(artifact),
             "stdout_log": str(segment_render_dir / "marker.stdout.log"),
             "stderr_log": str(segment_render_dir / "marker.stderr.log"),
@@ -759,10 +1066,13 @@ def run_segmented_marker_render(
     segment_manifest = {
         "doc_id": cfg.doc_id,
         "output_format": output_format,
+        "segment_strategy": segmentation_meta["segment_strategy"],
+        "segment_by_outline": cfg.segment_by_outline,
         "segment_pages": cfg.segment_pages,
         "requested_page_range": cfg.page_range,
-        "selected_page_count": len(requested_pages),
-        "total_pdf_pages": total_pages,
+        "selected_page_count": segmentation_meta["selected_page_count"],
+        "total_pdf_pages": segmentation_meta["total_pdf_pages"],
+        "outline_entry_count": segmentation_meta.get("outline_entry_count"),
         "cache_root": str(cache_root),
         "assembled_artifact": str(assembled_artifact),
         "segments": records,
@@ -771,15 +1081,18 @@ def run_segmented_marker_render(
     return (
         assembled_artifact,
         (
-            f"segmented_marker[{output_format}] x{len(records)} via --page_range "
-            f"(segment_pages={cfg.segment_pages}); see {segment_manifest_path}"
+            f"segmented_marker[{output_format}] x{len(records)} via "
+            f"{segmentation_meta['segment_strategy']} segmentation; see {segment_manifest_path}"
         ),
         {
             "segmented": True,
+            "segment_strategy": segmentation_meta["segment_strategy"],
+            "segment_by_outline": cfg.segment_by_outline,
             "segment_pages": cfg.segment_pages,
             "segment_count": len(records),
-            "selected_page_count": len(requested_pages),
-            "total_pdf_pages": total_pages,
+            "selected_page_count": segmentation_meta["selected_page_count"],
+            "total_pdf_pages": segmentation_meta["total_pdf_pages"],
+            "outline_entry_count": segmentation_meta.get("outline_entry_count"),
             "checkpoint_root": str(cache_root),
             "segment_manifest": str(segment_manifest_path),
         },
@@ -793,7 +1106,7 @@ def render_marker_output(
     artifacts_dir: Path,
     source_pdf_sha256: str,
 ) -> tuple[Path, str, dict[str, Any]]:
-    if cfg.segment_pages is not None:
+    if cfg.segment_pages is not None or cfg.segment_by_outline:
         return run_segmented_marker_render(
             cfg=cfg,
             output_format=output_format,
@@ -1412,6 +1725,15 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "disable_image_extraction": cfg.disable_image_extraction,
             "page_range": cfg.page_range,
             "segmented_run": bool(markdown_render_meta.get("segmented") or json_render_meta.get("segmented")),
+            "segment_by_outline": bool(
+                markdown_render_meta.get("segment_by_outline")
+                or json_render_meta.get("segment_by_outline")
+                or cfg.segment_by_outline
+            ),
+            "segment_strategy": (
+                markdown_render_meta.get("segment_strategy")
+                or json_render_meta.get("segment_strategy")
+            ),
             "segment_pages": cfg.segment_pages,
             "segment_count": markdown_render_meta.get("segment_count") or json_render_meta.get("segment_count"),
             "selected_page_count": (
@@ -1421,6 +1743,10 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "total_pdf_pages": (
                 markdown_render_meta.get("total_pdf_pages")
                 or json_render_meta.get("total_pdf_pages")
+            ),
+            "outline_entry_count": (
+                markdown_render_meta.get("outline_entry_count")
+                or json_render_meta.get("outline_entry_count")
             ),
             "checkpoint_root": (
                 markdown_render_meta.get("checkpoint_root")
