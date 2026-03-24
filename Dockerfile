@@ -6,6 +6,7 @@ FROM ${PYTHON_IMAGE}
 ARG APT_MIRROR=mirrors.aliyun.com
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG REQUIREMENTS_FILE=requirements.txt
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -34,9 +35,10 @@ RUN set -eux; \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
+COPY requirements /app/requirements
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /app/requirements.txt
+    pip install -r /app/${REQUIREMENTS_FILE}
 
 COPY . /app
 

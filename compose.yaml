@@ -7,6 +7,7 @@ services:
         APT_MIRROR: ${APT_MIRROR:-mirrors.aliyun.com}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+        REQUIREMENTS_FILE: requirements/phase01.txt
     env_file:
       - .env
     working_dir: /app
@@ -24,6 +25,7 @@ services:
         APT_MIRROR: ${APT_MIRROR:-mirrors.aliyun.com}
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+        REQUIREMENTS_FILE: requirements/phase02.txt
     env_file:
       - .env
     working_dir: /app
@@ -32,3 +34,21 @@ services:
       - ./data:/app/data
       - ./.cache/datalab:/root/.cache/datalab
     command: python src/02-semantic_chunking/pipeline.py --help
+
+  phase03:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-mirrors.aliyun.com}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+        REQUIREMENTS_FILE: requirements/phase03.txt
+    env_file:
+      - .env
+    working_dir: /app
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./.cache/datalab:/root/.cache/datalab
+    command: python src/03-vectorization/pipeline.py --help
