@@ -29,7 +29,7 @@ MAX_ID_LENGTH = 512
 MAX_TITLE_LENGTH = 4096
 MAX_TEXT_LENGTH = 65535
 PHASE03_SCHEMA_VERSION = "1.0"
-VECTOR_INDEX_NAME = "embedding_hnsw"
+VECTOR_INDEX_NAME = "embedding_flat"
 SCALAR_INDEX_FIELDS = (
     "doc_id",
     "chunk_type",
@@ -442,9 +442,9 @@ def build_collection_schema(vector_dim: int):
     vector_index_params.add_index(
         field_name=VECTOR_FIELD_NAME,
         index_name=VECTOR_INDEX_NAME,
-        index_type="HNSW",
+        index_type="FLAT",
         metric_type="COSINE",
-        params={"M": 16, "efConstruction": 200},
+        params={},
     )
     scalar_index_params = MilvusClient.prepare_index_params()
     for field_name in SCALAR_INDEX_FIELDS:
@@ -805,7 +805,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "vector_field": VECTOR_FIELD_NAME,
             "vector_index_name": VECTOR_INDEX_NAME,
             "vector_metric_type": "COSINE",
-            "vector_index_type_requested": "HNSW",
+            "vector_index_type_requested": "FLAT",
             "created_collection": created_collection,
         },
         "artifacts": {

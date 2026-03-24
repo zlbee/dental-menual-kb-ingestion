@@ -52,6 +52,9 @@ If you want to target a standalone or managed Milvus deployment, set
 - `MILVUS_COLLECTION_NAME`
 - `MILVUS_COLLECTION_PREFIX`
 
+Phase 03 uses a `FLAT` vector index with `COSINE` metric so it remains
+compatible with Milvus Lite.
+
 ## Docker Workflow
 
 The repository includes a `phase03` Compose service:
