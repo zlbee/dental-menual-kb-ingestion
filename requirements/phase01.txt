@@ -1,3 +1,10 @@
 # Phase 01 direct dependencies.
-# `marker-pdf` provides Marker, PyTorch, and the document conversion stack.
+# We keep this intentionally small for the first Dockerized run:
+# - `marker-pdf` provides Marker, PyTorch, and the document conversion stack.
 marker-pdf==1.10.2
+# - `pypdf` gives us lightweight page counting and a fallback outline reader
+#   for segmented phase-01 runs.
+pypdf>=5,<6
+# - `PyMuPDF` is preferred for reading the PDF's built-in outline / table of
+#   contents when segmenting by semantic sections.
+PyMuPDF>=1.24,<2
