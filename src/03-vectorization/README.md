@@ -94,3 +94,6 @@ Milvus Lite file under the phase-03 output root.
   `indexable` flag.
 - Re-running phase 03 for the same `doc_id` replaces that document's rows in
   Milvus before inserting the new vectors.
+- If Docker reports `No module named 'pkg_resources'` while opening a local
+  Milvus Lite database, rebuild the `phase03` image after pulling the latest
+  dependencies. `milvus-lite` currently requires `setuptools<82`.

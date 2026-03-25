@@ -8,13 +8,19 @@ services:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
         REQUIREMENTS_FILE: requirements/phase01.txt
+        TORCH_WHEEL_INDEX_URL: ${PHASE01_TORCH_WHEEL_INDEX_URL:-https://download.pytorch.org/whl/cu126}
     env_file:
       - .env
+    environment:
+      TORCH_DEVICE: ${PHASE01_TORCH_DEVICE:-cuda}
+      NVIDIA_VISIBLE_DEVICES: ${PHASE01_NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${PHASE01_NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
     working_dir: /app
     volumes:
       - ./src:/app/src
       - ./data:/app/data
       - ./.cache/datalab:/root/.cache/datalab
+    gpus: ${PHASE01_GPUS:-all}
     command: python src/01-structure_aware_chunking/pipeline.py --help
 
   phase02:

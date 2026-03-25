@@ -1,3 +1,5 @@
 # Phase 03 embeds semantic chunks and stores them in Milvus.
 langchain-openai==0.3.34
 pymilvus[milvus-lite]==2.6.9
+# milvus-lite still imports pkg_resources, which setuptools 82 removed.
+setuptools>=68.0.0,<82

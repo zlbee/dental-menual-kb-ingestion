@@ -7,6 +7,7 @@ ARG APT_MIRROR=mirrors.aliyun.com
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 ARG REQUIREMENTS_FILE=requirements.txt
+ARG TORCH_WHEEL_INDEX_URL=
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -38,7 +39,19 @@ COPY requirements.txt /app/requirements.txt
 COPY requirements /app/requirements
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r /app/${REQUIREMENTS_FILE}
+    set -eux; \
+    pip install -r /app/${REQUIREMENTS_FILE}; \
+    if [ -n "${TORCH_WHEEL_INDEX_URL}" ]; then \
+        TORCH_VERSION="$(pip show torch 2>/dev/null | sed -n 's/^Version: //p' | sed 's/+.*$//' | head -n 1)"; \
+        TORCHVISION_VERSION="$(pip show torchvision 2>/dev/null | sed -n 's/^Version: //p' | sed 's/+.*$//' | head -n 1)"; \
+        if [ -n "${TORCH_VERSION}" ]; then \
+            TORCH_SPECS="torch==${TORCH_VERSION}"; \
+            if [ -n "${TORCHVISION_VERSION}" ]; then \
+                TORCH_SPECS="${TORCH_SPECS} torchvision==${TORCHVISION_VERSION}"; \
+            fi; \
+            pip install --index-url "${TORCH_WHEEL_INDEX_URL}" --extra-index-url "${PIP_INDEX_URL}" ${TORCH_SPECS}; \
+        fi; \
+    fi
 
 COPY . /app
 

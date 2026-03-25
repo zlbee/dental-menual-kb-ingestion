@@ -28,18 +28,23 @@ There is also a `compose.yaml` with a `phase01` service so we can standardize th
 
 ### 1. Build the image
 
-The `Dockerfile` is prepared for Marker, but dependency installation is still intentionally commented out until we are ready to install:
+The `phase01` Compose service now rebuilds with a CUDA-compatible PyTorch wheel
+by default so Marker can use NVIDIA GPUs inside the container:
 
-```dockerfile
-RUN pip install -r /app/requirements.txt
+```powershell
+docker compose build phase01
 ```
+
+If you need to tune the runtime, these environment variables are supported:
+
+- `PHASE01_TORCH_WHEEL_INDEX_URL` to change the PyTorch wheel index. The default `cu126` build matches RTX 4070 hosts running CUDA 12.6 drivers.
+- `PHASE01_TORCH_DEVICE=cpu` to force CPU execution
+- `PHASE01_GPUS=all` or another Compose GPU request supported by your setup
 
 ### 2. Typical sample run
 
 The image installs dependencies once, then we bind-mount the host `src/` into the
 container so Python code changes are picked up immediately without rebuilding.
-
-Once dependency installation is enabled in the image:
 
 ```powershell
 docker build -t dental-kb-ingestion .
@@ -58,6 +63,15 @@ Or with Compose:
 docker compose run --rm phase01 `
   python src/01-structure_aware_chunking/pipeline.py `
     --input-pdf data/raw/ManualClinProcDentistry-Sample.pdf
+```
+
+To make the selected torch device explicit from the pipeline itself:
+
+```powershell
+docker compose run --rm phase01 `
+  python src/01-structure_aware_chunking/pipeline.py `
+    --input-pdf data/raw/ManualClinProcDentistry-Sample.pdf `
+    --torch-device cuda
 ```
 
 To also persist Marker JSON for the same run:
@@ -104,6 +118,13 @@ docker compose run --rm phase01 `
     --segment-pages 12
 ```
 
+To verify the container can see your GPU before a full run:
+
+```powershell
+docker compose run --rm phase01 `
+  python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"
+```
+
 ### 3. Running a PDF outside the workspace
 
 If the source PDF lives outside this repository, mount that parent folder explicitly and pass the in-container path:
@@ -123,8 +144,9 @@ docker run --rm `
 
 - The script renders markdown by default. Pass `--emit-json` if you also want Marker JSON artifacts and JSON-based normalization.
 - The script now defaults to Marker `--use_llm` with `marker.services.openai.OpenAIService`.
+- `phase01` accepts `--torch-device` and forwards it to Marker as `TORCH_DEVICE`. Useful values are `cuda`, `cuda:0`, and `cpu`.
 - `.env` values like `OPENAI_API_KEY`, `OPENAI_MODEL`, and optional `OPENAI_BASE_URL` are forwarded to the Marker CLI automatically.
-- `compose.yaml` mounts host `src/` and `data/` into `/app`, so code changes do not require rebuilding the image.
+- `compose.yaml` mounts host `src/` and `data/` into `/app`, requests NVIDIA GPUs for `phase01`, and defaults `TORCH_DEVICE` to `cuda`.
 - `--segment-pages` is an explicit opt-in recovery mode. It runs Marker in page batches and reassembles the final artifact afterwards. This improves resumability, but the final output can differ slightly from a single full-document Marker run, especially near segment boundaries or for cross-page table/header inference.
 - `--segment-by-outline` is another explicit opt-in recovery mode. It first tries to read the PDF's own outline/TOC entries and uses them as segment boundaries. If the outline is missing and `--segment-pages` is also set, the pipeline falls back to fixed page batches.
 - Segmented runs currently require `--disable-image-extraction` to stay enabled. That is already the default in this repository.

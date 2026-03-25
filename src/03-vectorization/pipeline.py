@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
+import importlib.util
 import json
 import os
 import re
@@ -379,6 +380,7 @@ def build_milvus_client(
                 "Milvus Lite local database files are not supported on Windows hosts. "
                 "Run phase03 via Docker, WSL, or configure MILVUS_URI for a remote Milvus deployment."
             )
+        ensure_local_milvus_runtime()
         ensure_dir(Path(uri).expanduser().resolve().parent)
         client = MilvusClient(uri=uri)
         return client, uri, True, None
@@ -390,6 +392,24 @@ def build_milvus_client(
         client_kwargs["db_name"] = db_name
     client = MilvusClient(**client_kwargs)
     return client, uri, False, db_name
+
+
+def ensure_local_milvus_runtime() -> None:
+    missing_modules: list[str] = []
+    if importlib.util.find_spec("milvus_lite") is None:
+        missing_modules.append("milvus_lite")
+    if importlib.util.find_spec("pkg_resources") is None:
+        missing_modules.append("pkg_resources")
+    if not missing_modules:
+        return
+
+    missing_list = ", ".join(missing_modules)
+    raise RuntimeError(
+        "Local Milvus Lite runtime is unavailable because these modules are missing: "
+        f"{missing_list}. Install phase03 dependencies with "
+        "`pymilvus[milvus-lite]==2.6.9` and `setuptools<82`, or rebuild the "
+        "`phase03` Docker image after updating dependencies."
+    )
 
 
 def describe_collection_dim(client: MilvusClient, collection_name: str) -> int | None:
@@ -451,7 +471,7 @@ def build_collection_schema(vector_dim: int):
         scalar_index_params.add_index(
             field_name=field_name,
             index_name=f"{field_name}_idx",
-            index_type="",
+            index_type="INVERTED",
         )
 
     return schema, vector_index_params, scalar_index_params
