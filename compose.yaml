@@ -58,3 +58,23 @@ services:
       - ./data:/app/data
       - ./.cache/datalab:/root/.cache/datalab
     command: python src/03-vectorization/pipeline.py --help
+
+  phase04:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APT_MIRROR: ${APT_MIRROR:-mirrors.aliyun.com}
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-pypi.tuna.tsinghua.edu.cn}
+        REQUIREMENTS_FILE: requirements/phase04.txt
+    env_file:
+      - .env
+    working_dir: /app
+    volumes:
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./.cache/datalab:/root/.cache/datalab
+    ports:
+      - "8000:8000"
+    command: uvicorn server:app --app-dir src/04-online_rag_service --host 0.0.0.0 --port 8000
