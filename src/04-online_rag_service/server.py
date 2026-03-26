@@ -6,7 +6,6 @@ import datetime as dt
 import json
 import os
 import re
-import sys
 import threading
 import time
 from contextlib import suppress
@@ -26,12 +25,14 @@ from starlette.concurrency import run_in_threadpool
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PHASE03_ROOT = REPO_ROOT / "data" / "processed" / "03_vectorization"
-DEFAULT_LOCAL_MILVUS_FILENAME = "knowledge_base.db"
+DEFAULT_STANDALONE_MILVUS_URI = "http://localhost:19530"
 DEFAULT_COLLECTION_PREFIX = "dental_kb_v1"
 VECTOR_FIELD_NAME = "embedding"
 PRIMARY_KEY_FIELD = "chunk_id"
 METADATA_FIELD = "metadata"
 PAGE_NULL_SENTINEL = -1
+VECTOR_SEARCH_METRIC_TYPE = "COSINE"
+VECTOR_SEARCH_PARAMS = {"ef": 128}
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
 DEFAULT_DENSE_TOP_K = 60
@@ -190,13 +191,13 @@ def parse_args() -> RuntimeConfig:
         "--phase03-root",
         type=Path,
         default=DEFAULT_PHASE03_ROOT,
-        help="Root directory for phase-03 outputs. Used to resolve the default local Milvus Lite path.",
+        help="Root directory for phase-03 outputs.",
     )
     parser.add_argument(
         "--milvus-uri",
         type=str,
         default=None,
-        help="Optional Milvus URI. Defaults to MILVUS_URI or the phase-03 local Milvus Lite file.",
+        help="Optional Milvus URI. Defaults to MILVUS_URI or the local Milvus standalone endpoint.",
     )
     parser.add_argument(
         "--milvus-token",
@@ -397,8 +398,7 @@ def resolve_milvus_uri(cfg: RuntimeConfig, env_values: dict[str, str]) -> str:
         return cfg.milvus_uri
     if env_values.get("MILVUS_URI"):
         return env_values["MILVUS_URI"]
-    local_db = cfg.phase03_root / "milvus" / DEFAULT_LOCAL_MILVUS_FILENAME
-    return str(local_db)
+    return DEFAULT_STANDALONE_MILVUS_URI
 
 
 def sanitize_milvus_uri(uri: str) -> str:
@@ -420,6 +420,16 @@ def resolve_collection_name(cfg: RuntimeConfig, env_values: dict[str, str]) -> s
     prefix = env_values.get("MILVUS_COLLECTION_PREFIX") or cfg.collection_prefix
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
     return f"{slugify(prefix)}_{slugify(embedding_model)}"
+
+
+def ensure_server_milvus_uri(uri: str) -> None:
+    if not is_local_milvus_uri(uri):
+        return
+    raise RuntimeError(
+        "Local Milvus Lite database files are not supported because phase03 now builds "
+        "HNSW indexes. Point MILVUS_URI to a Milvus standalone/server endpoint such as "
+        "http://localhost:19530 or http://milvus-standalone:19530 in Docker Compose."
+    )
 
 
 def build_embeddings(env_values: dict[str, str], *, model_env_name: str) -> OpenAIEmbeddings:
@@ -447,11 +457,8 @@ def build_milvus_client(
     token = cfg.milvus_token or env_values.get("MILVUS_TOKEN")
     db_name = cfg.milvus_db_name or env_values.get("MILVUS_DB_NAME")
 
-    if local_mode and sys.platform.startswith("win"):
-        raise RuntimeError(
-            "Local Milvus Lite database files are not supported on Windows hosts. "
-            "Run phase04 via Docker, WSL, or configure MILVUS_URI for a remote Milvus deployment."
-        )
+    if local_mode:
+        ensure_server_milvus_uri(uri)
 
     client_kwargs: dict[str, Any] = {"uri": uri}
     if token:
@@ -459,7 +466,7 @@ def build_milvus_client(
     if db_name:
         client_kwargs["db_name"] = db_name
 
-    return MilvusClient(**client_kwargs), uri, local_mode, db_name
+    return MilvusClient(**client_kwargs), uri, False, db_name
 
 
 def describe_collection_dim(client: MilvusClient, collection_name: str) -> int | None:
@@ -838,7 +845,7 @@ class OnlineRAGService:
                 filter=milvus_filter,
                 limit=top_k,
                 output_fields=SEARCH_OUTPUT_FIELDS,
-                search_params={"metric_type": "COSINE", "params": {}},
+                search_params={"metric_type": VECTOR_SEARCH_METRIC_TYPE, "params": dict(VECTOR_SEARCH_PARAMS)},
             )
 
         first_result_set: list[Any]

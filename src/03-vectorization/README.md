@@ -41,8 +41,8 @@ It also upserts the `indexable` semantic chunks into a Milvus collection.
 - Rich lineage arrays such as `heading_path` and `source_block_ids` are stored
   in a JSON metadata field.
 
-If `MILVUS_URI` is not set, phase 03 defaults to a local Milvus Lite database
-file under `data/processed/03_vectorization/milvus/knowledge_base.db`.
+If `MILVUS_URI` is not set, phase 03 defaults to a local Milvus standalone
+endpoint at `http://localhost:19530`.
 
 If you want to target a standalone or managed Milvus deployment, set
 `MILVUS_URI` to the server URL and optionally provide:
@@ -52,14 +52,17 @@ If you want to target a standalone or managed Milvus deployment, set
 - `MILVUS_COLLECTION_NAME`
 - `MILVUS_COLLECTION_PREFIX`
 
-Phase 03 uses a `FLAT` vector index with `COSINE` metric so it remains
-compatible with Milvus Lite.
+Phase 03 uses an `HNSW` vector index with `COSINE` metric and build params
+`M=16`, `efConstruction=200`, so it must run against Milvus standalone/server
+rather than Milvus Lite.
 
 ## Docker Workflow
 
 The repository includes a `phase03` Compose service:
 
 ```powershell
+docker compose up -d milvus-standalone
+
 docker compose run --rm phase03 `
   python src/03-vectorization/pipeline.py `
     --doc-id manualclinprocdentistry-sample
@@ -84,8 +87,9 @@ container environment:
 - `OPENAI_API_KEY`
 - `OPENAI_EMBEDDING_MODEL`
 
-Milvus settings are optional. Without `MILVUS_URI`, the pipeline uses a local
-Milvus Lite file under the phase-03 output root.
+Milvus settings are optional. Without `MILVUS_URI`, the pipeline uses
+`http://localhost:19530`. Inside Docker Compose, `phase03` defaults to
+`http://milvus-standalone:19530`.
 
 ## Notes
 
@@ -94,6 +98,6 @@ Milvus Lite file under the phase-03 output root.
   `indexable` flag.
 - Re-running phase 03 for the same `doc_id` replaces that document's rows in
   Milvus before inserting the new vectors.
-- If Docker reports `No module named 'pkg_resources'` while opening a local
-  Milvus Lite database, rebuild the `phase03` image after pulling the latest
-  dependencies. `milvus-lite` currently requires `setuptools<82`.
+- If the target collection still has the old `FLAT` vector index, phase 03 now
+  releases the collection, drops the stale vector index, and rebuilds it as
+  `HNSW`.

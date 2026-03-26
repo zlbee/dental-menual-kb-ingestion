@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import datetime as dt
-import importlib.util
 import json
 import os
 import re
 import sys
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
@@ -19,7 +19,7 @@ from pymilvus import DataType, MilvusClient
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PHASE02_ROOT = REPO_ROOT / "data" / "processed" / "02_semantic_chunking"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data" / "processed" / "03_vectorization"
-DEFAULT_LOCAL_MILVUS_FILENAME = "knowledge_base.db"
+DEFAULT_STANDALONE_MILVUS_URI = "http://localhost:19530"
 DEFAULT_COLLECTION_PREFIX = "dental_kb_v1"
 DEFAULT_EMBEDDING_BATCH_SIZE = 32
 PAGE_NULL_SENTINEL = -1
@@ -30,7 +30,10 @@ MAX_ID_LENGTH = 512
 MAX_TITLE_LENGTH = 4096
 MAX_TEXT_LENGTH = 65535
 PHASE03_SCHEMA_VERSION = "1.0"
-VECTOR_INDEX_NAME = "embedding_flat"
+VECTOR_INDEX_NAME = "embedding_hnsw"
+VECTOR_INDEX_TYPE = "HNSW"
+VECTOR_METRIC_TYPE = "COSINE"
+VECTOR_INDEX_BUILD_PARAMS = {"M": 16, "efConstruction": 200}
 SCALAR_INDEX_FIELDS = (
     "doc_id",
     "chunk_type",
@@ -109,7 +112,7 @@ def parse_args() -> PipelineConfig:
         "--milvus-uri",
         type=str,
         default=None,
-        help="Optional Milvus URI. Defaults to MILVUS_URI or a local Milvus Lite database file.",
+        help="Optional Milvus URI. Defaults to MILVUS_URI or the local Milvus standalone endpoint.",
     )
     parser.add_argument(
         "--milvus-token",
@@ -340,8 +343,7 @@ def resolve_milvus_uri(cfg: PipelineConfig, env_values: dict[str, str]) -> str:
         return cfg.milvus_uri
     if env_values.get("MILVUS_URI"):
         return env_values["MILVUS_URI"]
-    local_db = ensure_dir(cfg.output_root / "milvus") / DEFAULT_LOCAL_MILVUS_FILENAME
-    return str(local_db)
+    return DEFAULT_STANDALONE_MILVUS_URI
 
 
 def sanitize_milvus_uri(uri: str) -> str:
@@ -365,6 +367,16 @@ def resolve_collection_name(cfg: PipelineConfig, env_values: dict[str, str]) -> 
     return f"{slugify(prefix)}_{slugify(embedding_model)}"
 
 
+def ensure_server_milvus_uri(uri: str) -> None:
+    if not is_local_milvus_uri(uri):
+        return
+    raise RuntimeError(
+        "Local Milvus Lite database files are not supported because phase03 now builds "
+        "HNSW indexes. Point MILVUS_URI to a Milvus standalone/server endpoint such as "
+        "http://localhost:19530 or http://milvus-standalone:19530 in Docker Compose."
+    )
+
+
 def build_milvus_client(
     cfg: PipelineConfig,
     env_values: dict[str, str],
@@ -375,15 +387,7 @@ def build_milvus_client(
     db_name = cfg.milvus_db_name or env_values.get("MILVUS_DB_NAME")
 
     if local_mode:
-        if sys.platform.startswith("win"):
-            raise RuntimeError(
-                "Milvus Lite local database files are not supported on Windows hosts. "
-                "Run phase03 via Docker, WSL, or configure MILVUS_URI for a remote Milvus deployment."
-            )
-        ensure_local_milvus_runtime()
-        ensure_dir(Path(uri).expanduser().resolve().parent)
-        client = MilvusClient(uri=uri)
-        return client, uri, True, None
+        ensure_server_milvus_uri(uri)
 
     client_kwargs: dict[str, Any] = {"uri": uri}
     if token:
@@ -392,24 +396,6 @@ def build_milvus_client(
         client_kwargs["db_name"] = db_name
     client = MilvusClient(**client_kwargs)
     return client, uri, False, db_name
-
-
-def ensure_local_milvus_runtime() -> None:
-    missing_modules: list[str] = []
-    if importlib.util.find_spec("milvus_lite") is None:
-        missing_modules.append("milvus_lite")
-    if importlib.util.find_spec("pkg_resources") is None:
-        missing_modules.append("pkg_resources")
-    if not missing_modules:
-        return
-
-    missing_list = ", ".join(missing_modules)
-    raise RuntimeError(
-        "Local Milvus Lite runtime is unavailable because these modules are missing: "
-        f"{missing_list}. Install phase03 dependencies with "
-        "`pymilvus[milvus-lite]==2.6.9` and `setuptools<82`, or rebuild the "
-        "`phase03` Docker image after updating dependencies."
-    )
 
 
 def describe_collection_dim(client: MilvusClient, collection_name: str) -> int | None:
@@ -430,6 +416,98 @@ def describe_collection_dim(client: MilvusClient, collection_name: str) -> int |
         except (TypeError, ValueError):
             return None
     return None
+
+
+def build_vector_index_params():
+    vector_index_params = MilvusClient.prepare_index_params()
+    vector_index_params.add_index(
+        field_name=VECTOR_FIELD_NAME,
+        index_name=VECTOR_INDEX_NAME,
+        index_type=VECTOR_INDEX_TYPE,
+        metric_type=VECTOR_METRIC_TYPE,
+        params=dict(VECTOR_INDEX_BUILD_PARAMS),
+    )
+    return vector_index_params
+
+
+def build_scalar_index_params():
+    scalar_index_params = MilvusClient.prepare_index_params()
+    for field_name in SCALAR_INDEX_FIELDS:
+        scalar_index_params.add_index(
+            field_name=field_name,
+            index_name=f"{field_name}_idx",
+            index_type="INVERTED",
+        )
+    return scalar_index_params
+
+
+def describe_vector_indexes(client: MilvusClient, collection_name: str) -> list[dict[str, Any]]:
+    descriptions: list[dict[str, Any]] = []
+    for index_name in client.list_indexes(collection_name=collection_name):
+        description = client.describe_index(collection_name=collection_name, index_name=index_name)
+        if isinstance(description, dict):
+            raw_descriptions = [description]
+        elif isinstance(description, list):
+            raw_descriptions = [item for item in description if isinstance(item, dict)]
+        else:
+            raw_descriptions = []
+
+        for item in raw_descriptions:
+            field_name = item.get("field_name") or item.get("fieldName") or item.get("field")
+            if field_name == VECTOR_FIELD_NAME:
+                descriptions.append(item)
+    return descriptions
+
+
+def is_expected_vector_index(description: dict[str, Any]) -> bool:
+    return (
+        str(description.get("index_name") or "").strip() == VECTOR_INDEX_NAME
+        and str(description.get("index_type") or "").upper() == VECTOR_INDEX_TYPE
+        and str(description.get("metric_type") or "").upper() == VECTOR_METRIC_TYPE
+    )
+
+
+def ensure_vector_index(
+    client: MilvusClient,
+    *,
+    collection_name: str,
+    debug: bool,
+) -> bool:
+    descriptions = describe_vector_indexes(client, collection_name)
+    has_expected_index = any(is_expected_vector_index(description) for description in descriptions)
+    stale_index_names = sorted(
+        {
+            str(description.get("index_name")).strip()
+            for description in descriptions
+            if description.get("index_name") and not is_expected_vector_index(description)
+        }
+    )
+
+    if not stale_index_names and has_expected_index:
+        return False
+
+    with suppress(Exception):
+        client.release_collection(collection_name=collection_name)
+
+    for index_name in stale_index_names:
+        client.drop_index(collection_name=collection_name, index_name=index_name)
+        if debug:
+            print(
+                f"[phase03] Dropped stale vector index {index_name} on {collection_name}.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if not has_expected_index:
+        client.create_index(collection_name=collection_name, index_params=build_vector_index_params())
+        if debug:
+            print(
+                f"[phase03] Ensured {VECTOR_INDEX_TYPE} vector index {VECTOR_INDEX_NAME} on {collection_name}.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    return True
 
 
 def build_collection_schema(vector_dim: int):
@@ -458,23 +536,7 @@ def build_collection_schema(vector_dim: int):
     schema.add_field(field_name=METADATA_FIELD, datatype=DataType.JSON)
     schema.add_field(field_name=VECTOR_FIELD_NAME, datatype=DataType.FLOAT_VECTOR, dim=vector_dim)
 
-    vector_index_params = MilvusClient.prepare_index_params()
-    vector_index_params.add_index(
-        field_name=VECTOR_FIELD_NAME,
-        index_name=VECTOR_INDEX_NAME,
-        index_type="FLAT",
-        metric_type="COSINE",
-        params={},
-    )
-    scalar_index_params = MilvusClient.prepare_index_params()
-    for field_name in SCALAR_INDEX_FIELDS:
-        scalar_index_params.add_index(
-            field_name=field_name,
-            index_name=f"{field_name}_idx",
-            index_type="INVERTED",
-        )
-
-    return schema, vector_index_params, scalar_index_params
+    return schema, build_vector_index_params(), build_scalar_index_params()
 
 
 def ensure_collection(
@@ -492,6 +554,11 @@ def ensure_collection(
                 f"Milvus collection {collection_name} already exists with vector dimension "
                 f"{existing_dim}, but phase03 produced dimension {vector_dim}."
             )
+        ensure_vector_index(
+            client,
+            collection_name=collection_name,
+            debug=debug,
+        )
     else:
         schema, vector_index_params, scalar_index_params = build_collection_schema(vector_dim)
         client.create_collection(
@@ -785,6 +852,8 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
         else:
             milvus_uri = resolve_milvus_uri(cfg, env_values)
             local_milvus = is_local_milvus_uri(milvus_uri)
+            if local_milvus:
+                ensure_server_milvus_uri(milvus_uri)
             milvus_db_name = None if local_milvus else cfg.milvus_db_name or env_values.get("MILVUS_DB_NAME")
     finally:
         if milvus_client is not None:
@@ -824,8 +893,9 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "collection_name": collection_name,
             "vector_field": VECTOR_FIELD_NAME,
             "vector_index_name": VECTOR_INDEX_NAME,
-            "vector_metric_type": "COSINE",
-            "vector_index_type_requested": "FLAT",
+            "vector_metric_type": VECTOR_METRIC_TYPE,
+            "vector_index_type_requested": VECTOR_INDEX_TYPE,
+            "vector_index_build_params": dict(VECTOR_INDEX_BUILD_PARAMS),
             "created_collection": created_collection,
         },
         "artifacts": {

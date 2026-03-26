@@ -80,14 +80,16 @@ Milvus settings follow the same convention as phase 03:
 - `MILVUS_COLLECTION_NAME`
 - `MILVUS_COLLECTION_PREFIX`
 
-If `MILVUS_URI` is not set, phase 04 defaults to the local Milvus Lite database
-under `data/processed/03_vectorization/milvus/knowledge_base.db`.
+If `MILVUS_URI` is not set, phase 04 defaults to the local Milvus standalone
+endpoint at `http://localhost:19530`.
 
 ## Local Run
 
 From the repo root:
 
 ```powershell
+docker compose up -d milvus-standalone
+
 python src/04-online_rag_service/server.py
 ```
 
@@ -112,5 +114,6 @@ docker compose up phase04
 - The service returns both `display_text` and `retrieval_text`
   (`embedding_text`) so the downstream assistant can choose between
   presentation text and retrieval-optimized text.
-- On Windows hosts, local Milvus Lite database files are still not supported by
-  `pymilvus`; use Docker, WSL, or a remote Milvus deployment.
+- Phase 04 assumes the phase-03 vectors live in Milvus standalone/server
+  because phase 03 now builds an `HNSW` index. In Docker Compose, `phase04`
+  defaults to `http://milvus-standalone:19530`.

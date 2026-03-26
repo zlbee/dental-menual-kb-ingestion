@@ -3,6 +3,4 @@ uvicorn==0.35.0
 numpy>=1.26,<3.0
 rank-bm25==0.2.2
 langchain-openai==0.3.34
-pymilvus[milvus-lite]==2.6.9
-# milvus-lite still imports pkg_resources, which setuptools 82 removed.
-setuptools>=68.0.0,<82
+pymilvus==2.6.9
