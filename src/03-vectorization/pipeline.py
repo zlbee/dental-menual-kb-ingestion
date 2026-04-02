@@ -59,6 +59,7 @@ class PipelineConfig:
     collection_name: str | None
     collection_prefix: str
     embedding_batch_size: int
+    embedding_dimensions: int | None
     force: bool
     debug: bool
 
@@ -145,6 +146,12 @@ def parse_args() -> PipelineConfig:
         help="Embedding batch size passed to OpenAIEmbeddings.",
     )
     parser.add_argument(
+        "--embedding-dimensions",
+        type=int,
+        default=None,
+        help="Optional embedding dimension override for text-embedding-3* models.",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Overwrite existing phase-03 output artifacts for the target doc_id.",
@@ -160,6 +167,8 @@ def parse_args() -> PipelineConfig:
         parser.error("Provide either --input-manifest or --doc-id.")
     if parsed.embedding_batch_size <= 0:
         parser.error("--embedding-batch-size must be greater than 0.")
+    if parsed.embedding_dimensions is not None and parsed.embedding_dimensions <= 0:
+        parser.error("--embedding-dimensions must be greater than 0.")
 
     return PipelineConfig(
         input_manifest=parsed.input_manifest.expanduser().resolve() if parsed.input_manifest else None,
@@ -173,6 +182,7 @@ def parse_args() -> PipelineConfig:
         collection_name=parsed.collection_name,
         collection_prefix=parsed.collection_prefix,
         embedding_batch_size=parsed.embedding_batch_size,
+        embedding_dimensions=parsed.embedding_dimensions,
         force=parsed.force,
         debug=parsed.debug,
     )
@@ -218,6 +228,21 @@ def merged_env(extra_env: dict[str, str]) -> dict[str, str]:
     merged = dict(os.environ)
     merged.update(extra_env)
     return merged
+
+
+def parse_optional_positive_int(value: Any, *, label: str) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an integer.") from exc
+    if parsed <= 0:
+        raise ValueError(f"{label} must be greater than 0.")
+    return parsed
 
 
 def read_json(path: Path) -> Any:
@@ -302,7 +327,21 @@ def load_phase02_inputs(
     return manifest, manifest_path, semantic_chunks_path, semantic_chunks
 
 
-def build_embeddings(env_values: dict[str, str], batch_size: int) -> OpenAIEmbeddings:
+def resolve_embedding_dimensions(cfg: PipelineConfig, env_values: dict[str, str]) -> int | None:
+    if cfg.embedding_dimensions is not None:
+        return cfg.embedding_dimensions
+    return parse_optional_positive_int(
+        env_values.get("OPENAI_EMBEDDING_DIMENSIONS"),
+        label="OPENAI_EMBEDDING_DIMENSIONS",
+    )
+
+
+def build_embeddings(
+    env_values: dict[str, str],
+    batch_size: int,
+    *,
+    dimensions: int | None,
+) -> OpenAIEmbeddings:
     required = ("OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_EMBEDDING_MODEL")
     missing = [key for key in required if not env_values.get(key)]
     if missing:
@@ -310,12 +349,16 @@ def build_embeddings(env_values: dict[str, str], batch_size: int) -> OpenAIEmbed
             "Phase-03 vectorization requires these env vars: " + ", ".join(sorted(missing))
         )
 
-    return OpenAIEmbeddings(
-        base_url=env_values["OPENAI_BASE_URL"],
-        api_key=env_values["OPENAI_API_KEY"],
-        model=env_values["OPENAI_EMBEDDING_MODEL"],
-        chunk_size=batch_size,
-    )
+    kwargs: dict[str, Any] = {
+        "base_url": env_values["OPENAI_BASE_URL"],
+        "api_key": env_values["OPENAI_API_KEY"],
+        "model": env_values["OPENAI_EMBEDDING_MODEL"],
+        "chunk_size": batch_size,
+    }
+    if dimensions is not None:
+        kwargs["dimensions"] = dimensions
+
+    return OpenAIEmbeddings(**kwargs)
 
 
 def looks_like_remote_milvus_uri(uri: str) -> bool:
@@ -358,13 +401,21 @@ def sanitize_milvus_uri(uri: str) -> str:
     return sanitized if "://" in uri else sanitized.removeprefix("http://")
 
 
-def resolve_collection_name(cfg: PipelineConfig, env_values: dict[str, str]) -> str:
+def resolve_collection_name(
+    cfg: PipelineConfig,
+    env_values: dict[str, str],
+    *,
+    embedding_dimensions: int | None,
+) -> str:
     explicit_name = cfg.collection_name or env_values.get("MILVUS_COLLECTION_NAME")
     if explicit_name:
         return explicit_name
     prefix = env_values.get("MILVUS_COLLECTION_PREFIX") or cfg.collection_prefix
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
-    return f"{slugify(prefix)}_{slugify(embedding_model)}"
+    collection_name = f"{slugify(prefix)}_{slugify(embedding_model)}"
+    if embedding_dimensions is not None:
+        collection_name = f"{collection_name}_dim{embedding_dimensions}"
+    return collection_name
 
 
 def ensure_server_milvus_uri(uri: str) -> None:
@@ -780,10 +831,19 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
     env_values = merged_env(load_simple_env(cfg.env_file))
     phase02_manifest, phase02_manifest_path, semantic_chunks_path, semantic_chunks = load_phase02_inputs(cfg)
     doc_id = str(phase02_manifest["doc_id"])
+    embedding_dimensions = resolve_embedding_dimensions(cfg, env_values)
 
     print(f"[phase03] Starting vectorization for {doc_id}", file=sys.stderr, flush=True)
-    embeddings = build_embeddings(env_values, cfg.embedding_batch_size)
-    collection_name = resolve_collection_name(cfg, env_values)
+    embeddings = build_embeddings(
+        env_values,
+        cfg.embedding_batch_size,
+        dimensions=embedding_dimensions,
+    )
+    collection_name = resolve_collection_name(
+        cfg,
+        env_values,
+        embedding_dimensions=embedding_dimensions,
+    )
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
 
     output_root = ensure_dir(cfg.output_root)
@@ -884,6 +944,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "base_url": env_values.get("OPENAI_BASE_URL"),
             "model": embedding_model,
             "batch_size": cfg.embedding_batch_size,
+            "requested_dimensions": embedding_dimensions,
             "dimension": vector_dim,
         },
         "milvus": {

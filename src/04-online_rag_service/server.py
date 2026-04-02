@@ -78,6 +78,8 @@ class RuntimeConfig:
     milvus_db_name: str | None
     collection_name: str | None
     collection_prefix: str
+    embedding_dimensions: int | None
+    recall_dimensions: int | None
     host: str
     port: int
     dense_top_k: int
@@ -223,6 +225,18 @@ def parse_args() -> RuntimeConfig:
         default=DEFAULT_COLLECTION_PREFIX,
         help="Fallback collection prefix when MILVUS_COLLECTION_NAME is unset.",
     )
+    parser.add_argument(
+        "--embedding-dimensions",
+        type=int,
+        default=None,
+        help="Optional rerank/query embedding dimension override for text-embedding-3* models.",
+    )
+    parser.add_argument(
+        "--recall-dimensions",
+        type=int,
+        default=None,
+        help="Optional dense recall embedding dimension override. Falls back to --embedding-dimensions.",
+    )
     parser.add_argument("--host", type=str, default=DEFAULT_HOST, help="Bind host for the HTTP service.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port for the HTTP service.")
     parser.add_argument(
@@ -291,6 +305,10 @@ def parse_args() -> RuntimeConfig:
         help="Enable verbose logging and debug-friendly responses.",
     )
     args = parser.parse_args()
+    if args.embedding_dimensions is not None and args.embedding_dimensions <= 0:
+        parser.error("--embedding-dimensions must be greater than 0.")
+    if args.recall_dimensions is not None and args.recall_dimensions <= 0:
+        parser.error("--recall-dimensions must be greater than 0.")
 
     return RuntimeConfig(
         env_file=args.env_file,
@@ -300,6 +318,8 @@ def parse_args() -> RuntimeConfig:
         milvus_db_name=args.milvus_db_name,
         collection_name=args.collection_name,
         collection_prefix=args.collection_prefix,
+        embedding_dimensions=args.embedding_dimensions,
+        recall_dimensions=args.recall_dimensions,
         host=args.host,
         port=args.port,
         dense_top_k=args.dense_top_k,
@@ -325,6 +345,8 @@ def default_runtime_config() -> RuntimeConfig:
         milvus_db_name=None,
         collection_name=None,
         collection_prefix=DEFAULT_COLLECTION_PREFIX,
+        embedding_dimensions=None,
+        recall_dimensions=None,
         host=DEFAULT_HOST,
         port=DEFAULT_PORT,
         dense_top_k=DEFAULT_DENSE_TOP_K,
@@ -365,6 +387,21 @@ def merged_env(extra_env: dict[str, str]) -> dict[str, str]:
     merged = dict(os.environ)
     merged.update(extra_env)
     return merged
+
+
+def parse_optional_positive_int(value: Any, *, label: str) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be an integer.") from exc
+    if parsed <= 0:
+        raise ValueError(f"{label} must be greater than 0.")
+    return parsed
 
 
 def slugify(value: str) -> str:
@@ -413,13 +450,44 @@ def sanitize_milvus_uri(uri: str) -> str:
     return sanitized if "://" in uri else sanitized.removeprefix("http://")
 
 
+def resolve_requested_dimensions(
+    cli_value: int | None,
+    env_values: dict[str, str],
+    *,
+    env_name: str,
+    fallback_env_name: str | None = None,
+    default: int | None = None,
+) -> int | None:
+    if cli_value is not None:
+        return cli_value
+    env_value = env_values.get(env_name)
+    if env_value is None and fallback_env_name:
+        env_value = env_values.get(fallback_env_name)
+    if env_value is None:
+        return default
+    return parse_optional_positive_int(env_value, label=env_name)
+
+
+def model_supports_shortened_dimensions(model_name: str) -> bool:
+    normalized = model_name.strip().lower().split("/")[-1]
+    return normalized.startswith("text-embedding-3")
+
+
 def resolve_collection_name(cfg: RuntimeConfig, env_values: dict[str, str]) -> str:
     explicit_name = cfg.collection_name or env_values.get("MILVUS_COLLECTION_NAME")
     if explicit_name:
         return explicit_name
     prefix = env_values.get("MILVUS_COLLECTION_PREFIX") or cfg.collection_prefix
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
-    return f"{slugify(prefix)}_{slugify(embedding_model)}"
+    embedding_dimensions = resolve_requested_dimensions(
+        cfg.embedding_dimensions,
+        env_values,
+        env_name="OPENAI_EMBEDDING_DIMENSIONS",
+    )
+    collection_name = f"{slugify(prefix)}_{slugify(embedding_model)}"
+    if embedding_dimensions is not None:
+        collection_name = f"{collection_name}_dim{embedding_dimensions}"
+    return collection_name
 
 
 def ensure_server_milvus_uri(uri: str) -> None:
@@ -432,7 +500,12 @@ def ensure_server_milvus_uri(uri: str) -> None:
     )
 
 
-def build_embeddings(env_values: dict[str, str], *, model_env_name: str) -> OpenAIEmbeddings:
+def build_embeddings(
+    env_values: dict[str, str],
+    *,
+    model_env_name: str,
+    dimensions: int | None,
+) -> OpenAIEmbeddings:
     required = ("OPENAI_BASE_URL", "OPENAI_API_KEY", model_env_name)
     missing = [name for name in required if not env_values.get(name)]
     if missing:
@@ -440,12 +513,16 @@ def build_embeddings(env_values: dict[str, str], *, model_env_name: str) -> Open
             "Phase-04 online RAG service requires these env vars: " + ", ".join(sorted(missing))
         )
 
-    return OpenAIEmbeddings(
-        base_url=env_values["OPENAI_BASE_URL"],
-        api_key=env_values["OPENAI_API_KEY"],
-        model=env_values[model_env_name],
-        max_retries=3,
-    )
+    kwargs: dict[str, Any] = {
+        "base_url": env_values["OPENAI_BASE_URL"],
+        "api_key": env_values["OPENAI_API_KEY"],
+        "model": env_values[model_env_name],
+        "max_retries": 3,
+    }
+    if dimensions is not None:
+        kwargs["dimensions"] = dimensions
+
+    return OpenAIEmbeddings(**kwargs)
 
 
 def build_milvus_client(
@@ -713,12 +790,42 @@ class OnlineRAGService:
         self.vector_dim = describe_collection_dim(self.client, self.collection_name)
         self.recall_model = env_values["OPENAI_RECALL_MODEL"]
         self.rerank_model = env_values["OPENAI_EMBEDDING_MODEL"]
-        self.recall_embeddings = build_embeddings(env_values, model_env_name="OPENAI_RECALL_MODEL")
+        self.recall_dimensions = resolve_requested_dimensions(
+            cfg.recall_dimensions,
+            env_values,
+            env_name="OPENAI_RECALL_DIMENSIONS",
+            fallback_env_name="OPENAI_EMBEDDING_DIMENSIONS",
+            default=self.vector_dim if model_supports_shortened_dimensions(self.recall_model) else None,
+        )
+        self.rerank_dimensions = resolve_requested_dimensions(
+            cfg.embedding_dimensions,
+            env_values,
+            env_name="OPENAI_EMBEDDING_DIMENSIONS",
+            default=self.vector_dim if model_supports_shortened_dimensions(self.rerank_model) else None,
+        )
+        if self.vector_dim is not None:
+            if self.recall_dimensions is not None and self.recall_dimensions != self.vector_dim:
+                raise RuntimeError(
+                    f"Configured recall embedding dimensions ({self.recall_dimensions}) do not "
+                    f"match Milvus collection dimension ({self.vector_dim})."
+                )
+            if self.rerank_dimensions is not None and self.rerank_dimensions != self.vector_dim:
+                raise RuntimeError(
+                    f"Configured rerank embedding dimensions ({self.rerank_dimensions}) do not "
+                    f"match Milvus collection dimension ({self.vector_dim})."
+                )
+        self.recall_embeddings = build_embeddings(
+            env_values,
+            model_env_name="OPENAI_RECALL_MODEL",
+            dimensions=self.recall_dimensions,
+        )
         if self.recall_model == self.rerank_model:
             self.rerank_embeddings = self.recall_embeddings
         else:
             self.rerank_embeddings = build_embeddings(
-                env_values, model_env_name="OPENAI_EMBEDDING_MODEL"
+                env_values,
+                model_env_name="OPENAI_EMBEDDING_MODEL",
+                dimensions=self.rerank_dimensions,
             )
         self._state_lock = threading.RLock()
         self._milvus_lock = threading.RLock()
@@ -740,7 +847,9 @@ class OnlineRAGService:
             },
             "models": {
                 "recall": self.recall_model,
+                "recall_dimensions": self.recall_dimensions,
                 "rerank": self.rerank_model,
+                "rerank_dimensions": self.rerank_dimensions,
             },
             "defaults": {
                 "dense_top_k": self.cfg.dense_top_k,

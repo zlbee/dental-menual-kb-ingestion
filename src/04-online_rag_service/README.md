@@ -71,6 +71,8 @@ Example request:
 - `OPENAI_API_KEY`
 - `OPENAI_RECALL_MODEL`
 - `OPENAI_EMBEDDING_MODEL`
+- `OPENAI_RECALL_DIMENSIONS` (optional)
+- `OPENAI_EMBEDDING_DIMENSIONS` (optional)
 
 Milvus settings follow the same convention as phase 03:
 
@@ -114,6 +116,9 @@ docker compose up phase04
 - The service returns both `display_text` and `retrieval_text`
   (`embedding_text`) so the downstream assistant can choose between
   presentation text and retrieval-optimized text.
+- For `text-embedding-3*` models, phase 04 can query with shortened embeddings.
+  If dimensions are not explicitly configured, the service now defaults query
+  embeddings to the Milvus collection dimension when possible.
 - Phase 04 assumes the phase-03 vectors live in Milvus standalone/server
   because phase 03 now builds an `HNSW` index. In Docker Compose, `phase04`
   defaults to `http://milvus-standalone:19530`.

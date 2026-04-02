@@ -148,5 +148,5 @@ services:
       - ./data:/app/data
       - ./.cache/datalab:/root/.cache/datalab
     ports:
-      - "8000:8000"
+      - "8010:8000"
     command: uvicorn server:app --app-dir src/04-online_rag_service --host 0.0.0.0 --port 8000
