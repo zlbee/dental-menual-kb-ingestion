@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import datetime as dt
 import json
+import logging
 import os
 import re
 import threading
@@ -19,6 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from langchain_openai import OpenAIEmbeddings
 from pydantic import BaseModel, ConfigDict, Field
 from pymilvus import MilvusClient
+from pymilvus.exceptions import MilvusException
 from rank_bm25 import BM25Okapi
 from starlette.concurrency import run_in_threadpool
 
@@ -46,6 +48,8 @@ DEFAULT_BODY_WEIGHT = 0.35
 DEFAULT_HEADING_WEIGHT = 0.15
 DEFAULT_RERANK_FUSION_BOOST = 0.15
 QUERY_ITERATOR_BATCH_SIZE = 1000
+DEFAULT_STARTUP_RELOAD_MAX_ATTEMPTS = 8
+DEFAULT_STARTUP_RELOAD_RETRY_DELAY_SECONDS = 5.0
 MAX_TOP_K = 50
 MAX_RECALL_K = 500
 MAX_CANDIDATE_POOL = 1000
@@ -67,6 +71,13 @@ MILVUS_OUTPUT_FIELDS = [
 ]
 SEARCH_OUTPUT_FIELDS = [PRIMARY_KEY_FIELD]
 VECTOR_GET_OUTPUT_FIELDS = [PRIMARY_KEY_FIELD, VECTOR_FIELD_NAME]
+TRANSIENT_MILVUS_ERROR_MARKERS = (
+    "channel distribution is not serviceable",
+    "channel not available",
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -497,6 +508,16 @@ def normalize_result_item(item: Any) -> dict[str, Any]:
     return item
 
 
+def is_transient_milvus_query_error(exc: Exception) -> bool:
+    if not isinstance(exc, MilvusException):
+        return False
+    if getattr(exc, "code", None) != 503:
+        return False
+
+    message = str(exc).lower()
+    return any(marker in message for marker in TRANSIENT_MILVUS_ERROR_MARKERS)
+
+
 def empty_to_none(value: Any) -> str | None:
     if value is None:
         return None
@@ -820,6 +841,34 @@ class OnlineRAGService:
             "loaded_at_utc": index.loaded_at_utc,
             "config": self.config_snapshot(),
         }
+
+    def reload_with_retry(
+        self,
+        *,
+        max_attempts: int = DEFAULT_STARTUP_RELOAD_MAX_ATTEMPTS,
+        retry_delay_seconds: float = DEFAULT_STARTUP_RELOAD_RETRY_DELAY_SECONDS,
+    ) -> dict[str, Any]:
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self.reload()
+            except Exception as exc:
+                last_exc = exc
+                if not is_transient_milvus_query_error(exc) or attempt >= max_attempts:
+                    raise
+                logger.warning(
+                    "Milvus collection %s is not query-ready yet (%s/%s): %s. Retrying in %.1f seconds.",
+                    self.collection_name,
+                    attempt,
+                    max_attempts,
+                    exc,
+                    retry_delay_seconds,
+                )
+                time.sleep(retry_delay_seconds)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("reload_with_retry exhausted attempts without a result.")
 
     def _require_index(self) -> RetrievalIndex:
         with self._state_lock:
@@ -1183,8 +1232,8 @@ def create_app(cfg: RuntimeConfig) -> FastAPI:
     @app.on_event("startup")
     async def on_startup() -> None:
         service = OnlineRAGService(cfg, env_values)
-        await run_in_threadpool(service.reload)
         app.state.rag_service = service
+        await run_in_threadpool(service.reload_with_retry)
 
     @app.on_event("shutdown")
     async def on_shutdown() -> None:
