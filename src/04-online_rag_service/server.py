@@ -12,6 +12,8 @@ import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Sequence
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
@@ -72,7 +74,6 @@ MILVUS_OUTPUT_FIELDS = [
     METADATA_FIELD,
 ]
 SEARCH_OUTPUT_FIELDS = [PRIMARY_KEY_FIELD]
-VECTOR_GET_OUTPUT_FIELDS = [PRIMARY_KEY_FIELD, VECTOR_FIELD_NAME]
 TRANSIENT_MILVUS_ERROR_MARKERS = (
     "channel distribution is not serviceable",
     "channel not available",
@@ -160,6 +161,12 @@ class CandidateScore:
     heading_bm25: float | None = None
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class RerankHit:
+    index: int
+    relevance_score: float
+
+
 class RetrievalFilters(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -190,7 +197,7 @@ def parse_args() -> RuntimeConfig:
     parser = argparse.ArgumentParser(
         description=(
             "Run the phase-04 online RAG service with Milvus dense recall, "
-            "Elasticsearch BM25 lexical recall, and embedding reranking."
+            "Elasticsearch BM25 lexical recall, and API-based reranking."
         )
     )
     parser.add_argument(
@@ -307,7 +314,7 @@ def parse_args() -> RuntimeConfig:
         "--rerank-fusion-boost",
         type=float,
         default=DEFAULT_RERANK_FUSION_BOOST,
-        help="Small fusion prior added on top of the exact rerank cosine score.",
+        help="Small fusion prior added on top of the reranker relevance score.",
     )
     parser.add_argument(
         "--debug",
@@ -543,6 +550,17 @@ def build_embeddings(env_values: dict[str, str], *, model_env_name: str) -> Open
     )
 
 
+def resolve_rerank_model(env_values: dict[str, str]) -> str:
+    model_name = (env_values.get("OPENAI_RERANK_MODEL") or "").strip()
+    if not model_name:
+        raise RuntimeError("Phase-04 online RAG service requires env var: OPENAI_RERANK_MODEL")
+    return model_name
+
+
+def resolve_rerank_endpoint(base_url: str) -> str:
+    return base_url.rstrip("/") + "/rerank"
+
+
 def build_milvus_client(
     cfg: RuntimeConfig,
     env_values: dict[str, str],
@@ -772,15 +790,6 @@ def ensure_cosine_vector(vector: Sequence[float], *, expected_dim: int | None = 
     return array
 
 
-def cosine_similarity(query_vector: np.ndarray, candidate_vector: Sequence[float]) -> float:
-    candidate = ensure_cosine_vector(candidate_vector, expected_dim=int(query_vector.shape[0]))
-    query_norm = float(np.linalg.norm(query_vector))
-    candidate_norm = float(np.linalg.norm(candidate))
-    if query_norm == 0.0 or candidate_norm == 0.0:
-        return 0.0
-    return float(np.dot(query_vector, candidate) / (query_norm * candidate_norm))
-
-
 class OnlineRAGService:
     def __init__(self, cfg: RuntimeConfig, env_values: dict[str, str]) -> None:
         self.cfg = cfg
@@ -797,14 +806,10 @@ class OnlineRAGService:
         )
         self.vector_dim = describe_collection_dim(self.client, self.collection_name)
         self.recall_model = env_values["OPENAI_RECALL_MODEL"]
-        self.rerank_model = env_values["OPENAI_EMBEDDING_MODEL"]
+        self.rerank_model = resolve_rerank_model(env_values)
+        self.rerank_endpoint = resolve_rerank_endpoint(env_values["OPENAI_BASE_URL"])
+        self.rerank_api_key = env_values["OPENAI_API_KEY"]
         self.recall_embeddings = build_embeddings(env_values, model_env_name="OPENAI_RECALL_MODEL")
-        if self.recall_model == self.rerank_model:
-            self.rerank_embeddings = self.recall_embeddings
-        else:
-            self.rerank_embeddings = build_embeddings(
-                env_values, model_env_name="OPENAI_EMBEDDING_MODEL"
-            )
         self._state_lock = threading.RLock()
         self._milvus_lock = threading.RLock()
         self._elasticsearch_lock = threading.RLock()
@@ -980,9 +985,8 @@ class OnlineRAGService:
                 return None
         return int(response.get("count") or 0)
 
-    def _embed_query(self, query: str, *, for_rerank: bool) -> np.ndarray:
-        embeddings = self.rerank_embeddings if for_rerank else self.recall_embeddings
-        vector = embeddings.embed_query(query)
+    def _embed_query(self, query: str) -> np.ndarray:
+        vector = self.recall_embeddings.embed_query(query)
         return ensure_cosine_vector(vector, expected_dim=self.vector_dim)
 
     def _dense_search(self, query_vector: np.ndarray, *, milvus_filter: str, top_k: int) -> list[LaneHit]:
@@ -1085,25 +1089,55 @@ class OnlineRAGService:
             )
         return lexical_hits
 
-    def _fetch_candidate_vectors(self, chunk_ids: list[str]) -> dict[str, Sequence[float]]:
-        if not chunk_ids:
+    def _rerank_candidates(self, query: str, documents: list[str]) -> dict[int, float]:
+        if not documents:
             return {}
-        with self._milvus_lock:
-            rows = self.client.get(
-                collection_name=self.collection_name,
-                ids=chunk_ids,
-                output_fields=VECTOR_GET_OUTPUT_FIELDS,
-            )
 
-        vectors: dict[str, Sequence[float]] = {}
-        for item in rows:
-            row = normalize_result_item(item)
-            chunk_id = row.get(PRIMARY_KEY_FIELD) or row.get("id") or row.get("pk")
-            vector = row.get(VECTOR_FIELD_NAME)
-            if chunk_id is None or vector is None:
+        payload = {
+            "model": self.rerank_model,
+            "query": query,
+            "documents": documents,
+            "top_n": len(documents),
+        }
+        raw_payload = json.dumps(payload).encode("utf-8")
+        request = urllib_request.Request(
+            self.rerank_endpoint,
+            data=raw_payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.rerank_api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urllib_request.urlopen(request, timeout=60) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Rerank request failed with HTTP {exc.code}: {error_body}"
+            ) from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"Rerank request failed: {exc.reason}") from exc
+
+        raw_results = response_payload.get("results")
+        if not isinstance(raw_results, list):
+            raise RuntimeError(f"Unexpected rerank response payload: {response_payload!r}")
+
+        rerank_scores: dict[int, float] = {}
+        for item in raw_results:
+            if not isinstance(item, dict):
                 continue
-            vectors[str(chunk_id)] = vector
-        return vectors
+            try:
+                hit = RerankHit(
+                    index=int(item["index"]),
+                    relevance_score=float(item["relevance_score"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            rerank_scores[hit.index] = hit.relevance_score
+        return rerank_scores
 
     def retrieve(self, request: RetrieveRequest) -> dict[str, Any]:
         if request.filters is not None and request.filters.page_from and request.filters.page_to:
@@ -1125,7 +1159,7 @@ class OnlineRAGService:
         milvus_filter = build_milvus_filter(request.filters)
         started_at = time.perf_counter()
 
-        recall_query_vector = self._embed_query(query, for_rerank=False)
+        recall_query_vector = self._embed_query(query)
         dense_started_at = time.perf_counter()
         dense_hits = self._dense_search(
             recall_query_vector,
@@ -1205,28 +1239,39 @@ class OnlineRAGService:
                 "results": [],
             }
 
-        rerank_query_vector = (
-            recall_query_vector
-            if self.recall_model == self.rerank_model
-            else self._embed_query(query, for_rerank=True)
-        )
-        candidate_ids = [candidate.chunk_id for candidate in ranked_candidates]
-        candidate_vectors = self._fetch_candidate_vectors(candidate_ids)
-
-        results: list[dict[str, Any]] = []
+        rerank_documents: list[str] = []
+        rerank_rows: list[ChunkRecord] = []
+        rerank_candidates: list[CandidateScore] = []
         for candidate in ranked_candidates:
             row = index.row_by_chunk_id.get(candidate.chunk_id)
-            vector = candidate_vectors.get(candidate.chunk_id)
-            if row is None or vector is None:
+            if row is None:
                 continue
-            rerank_cosine = cosine_similarity(rerank_query_vector, vector)
-            final_score = rerank_cosine + (self.cfg.rerank_fusion_boost * candidate.fused_rrf)
+            rerank_rows.append(row)
+            rerank_candidates.append(candidate)
+            rerank_documents.append(row.embedding_text or row.display_text)
+
+        rerank_started_at = time.perf_counter()
+        rerank_scores = self._rerank_candidates(query, rerank_documents)
+        rerank_took_ms = round((time.perf_counter() - rerank_started_at) * 1000, 2)
+        if self.cfg.debug:
+            logger.info(
+                "rerank lane rerank_ms=%s rerank_candidates=%s",
+                rerank_took_ms,
+                len(rerank_documents),
+            )
+
+        results: list[dict[str, Any]] = []
+        for rerank_index, (candidate, row) in enumerate(zip(rerank_candidates, rerank_rows, strict=False)):
+            relevance_score = rerank_scores.get(rerank_index)
+            if relevance_score is None:
+                continue
+            final_score = relevance_score + (self.cfg.rerank_fusion_boost * candidate.fused_rrf)
             results.append(
                 {
                     "chunk": row,
                     "scores": {
                         "final_score": float(final_score),
-                        "rerank_cosine": float(rerank_cosine),
+                        "rerank_relevance_score": float(relevance_score),
                         "fused_rrf": float(candidate.fused_rrf),
                         "dense_rrf": float(candidate.dense_rrf),
                         "body_rrf": float(candidate.body_rrf),
@@ -1245,7 +1290,7 @@ class OnlineRAGService:
         results.sort(
             key=lambda item: (
                 item["scores"]["final_score"],
-                item["scores"]["rerank_cosine"],
+                item["scores"]["rerank_relevance_score"],
                 item["scores"]["fused_rrf"],
             ),
             reverse=True,

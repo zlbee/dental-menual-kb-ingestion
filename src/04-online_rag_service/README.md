@@ -18,8 +18,10 @@ At query time the service runs three first-stage retrieval lanes:
 - Elasticsearch BM25 over `heading_path_text`
 
 The three lanes are fused with weighted reciprocal rank fusion (RRF), then the
-candidate set is reranked with exact cosine similarity using
-`OPENAI_EMBEDDING_MODEL` against the vectors already stored in Milvus.
+candidate set is reranked through an external rerank API using
+`OPENAI_RERANK_MODEL`. The final score is:
+
+- `final_score = rerank_relevance_score + rerank_fusion_boost * fused_rrf`
 
 ## Data Contract
 
@@ -77,6 +79,7 @@ Example request:
 - `OPENAI_API_KEY`
 - `OPENAI_RECALL_MODEL`
 - `OPENAI_EMBEDDING_MODEL`
+- `OPENAI_RERANK_MODEL`
 
 Milvus settings follow the same convention as phase 03:
 
@@ -135,6 +138,7 @@ docker compose up phase04
 - The service returns both `display_text` and `retrieval_text`
   (`embedding_text`) so the downstream assistant can choose between
   presentation text and retrieval-optimized text.
+- `OPENAI_RERANK_MODEL` must be set explicitly in `.env` or the runtime environment.
 - Phase 04 assumes the phase-03 vectors live in Milvus standalone/server
   because phase 03 now builds an `HNSW` index. In Docker Compose, `phase04`
   defaults to `http://milvus-standalone:19530`.
