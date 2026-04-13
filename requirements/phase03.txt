@@ -1,3 +1,4 @@
 # Phase 03 embeds semantic chunks and stores them in Milvus.
+elasticsearch==8.15.1
 langchain-openai==0.3.34
 pymilvus==2.6.9

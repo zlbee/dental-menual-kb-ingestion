@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlsplit, urlunsplit
 
+from elasticsearch import Elasticsearch, helpers as elasticsearch_helpers
 from langchain_openai import OpenAIEmbeddings
 from pymilvus import DataType, MilvusClient
 
@@ -20,7 +21,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PHASE02_ROOT = REPO_ROOT / "data" / "processed" / "02_semantic_chunking"
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data" / "processed" / "03_vectorization"
 DEFAULT_STANDALONE_MILVUS_URI = "http://localhost:19530"
+DEFAULT_STANDALONE_ELASTICSEARCH_URL = "http://localhost:9200"
 DEFAULT_COLLECTION_PREFIX = "dental_kb_v1"
+DEFAULT_LEXICAL_ANALYZER = "english"
 DEFAULT_EMBEDDING_BATCH_SIZE = 32
 PAGE_NULL_SENTINEL = -1
 VECTOR_FIELD_NAME = "embedding"
@@ -58,6 +61,8 @@ class PipelineConfig:
     milvus_db_name: str | None
     collection_name: str | None
     collection_prefix: str
+    elasticsearch_url: str | None
+    elasticsearch_index_name: str | None
     embedding_batch_size: int
     force: bool
     debug: bool
@@ -139,6 +144,18 @@ def parse_args() -> PipelineConfig:
         help="Collection prefix used when --collection-name is omitted.",
     )
     parser.add_argument(
+        "--elasticsearch-url",
+        type=str,
+        default=None,
+        help="Optional Elasticsearch URL. Defaults to ELASTICSEARCH_URL or http://localhost:9200.",
+    )
+    parser.add_argument(
+        "--elasticsearch-index-name",
+        type=str,
+        default=None,
+        help="Optional explicit Elasticsearch index name for lexical retrieval documents.",
+    )
+    parser.add_argument(
         "--embedding-batch-size",
         type=int,
         default=DEFAULT_EMBEDDING_BATCH_SIZE,
@@ -172,6 +189,8 @@ def parse_args() -> PipelineConfig:
         milvus_db_name=parsed.milvus_db_name,
         collection_name=parsed.collection_name,
         collection_prefix=parsed.collection_prefix,
+        elasticsearch_url=parsed.elasticsearch_url,
+        elasticsearch_index_name=parsed.elasticsearch_index_name,
         embedding_batch_size=parsed.embedding_batch_size,
         force=parsed.force,
         debug=parsed.debug,
@@ -218,6 +237,17 @@ def merged_env(extra_env: dict[str, str]) -> dict[str, str]:
     merged = dict(os.environ)
     merged.update(extra_env)
     return merged
+
+
+def env_flag(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Could not parse boolean environment value: {value!r}")
 
 
 def read_json(path: Path) -> Any:
@@ -365,6 +395,205 @@ def resolve_collection_name(cfg: PipelineConfig, env_values: dict[str, str]) -> 
     prefix = env_values.get("MILVUS_COLLECTION_PREFIX") or cfg.collection_prefix
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
     return f"{slugify(prefix)}_{slugify(embedding_model)}"
+
+
+def resolve_elasticsearch_url(cfg: PipelineConfig, env_values: dict[str, str]) -> str:
+    if cfg.elasticsearch_url:
+        return cfg.elasticsearch_url
+    if env_values.get("ELASTICSEARCH_URL"):
+        return env_values["ELASTICSEARCH_URL"]
+    return DEFAULT_STANDALONE_ELASTICSEARCH_URL
+
+
+def sanitize_elasticsearch_url(url: str) -> str:
+    parsed = urlsplit(url if "://" in url else f"http://{url}")
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    return sanitized if "://" in url else sanitized.removeprefix("http://")
+
+
+def resolve_elasticsearch_index_name(cfg: PipelineConfig, env_values: dict[str, str]) -> str:
+    explicit_name = cfg.elasticsearch_index_name or env_values.get("ELASTICSEARCH_INDEX_NAME")
+    if explicit_name:
+        return explicit_name
+    return f"{resolve_collection_name(cfg, env_values)}_lexical"
+
+
+def build_elasticsearch_client(
+    cfg: PipelineConfig,
+    env_values: dict[str, str],
+) -> tuple[Elasticsearch, str, str, bool]:
+    url = resolve_elasticsearch_url(cfg, env_values)
+    index_name = resolve_elasticsearch_index_name(cfg, env_values)
+    verify_certs = env_flag(env_values.get("ELASTICSEARCH_VERIFY_CERTS"), default=True)
+    username = env_values.get("ELASTICSEARCH_USERNAME")
+    password = env_values.get("ELASTICSEARCH_PASSWORD")
+    api_key = env_values.get("ELASTICSEARCH_API_KEY")
+    ca_certs = env_values.get("ELASTICSEARCH_CA_CERT_PATH")
+
+    client_kwargs: dict[str, Any] = {
+        "hosts": [url],
+        "verify_certs": verify_certs,
+        "request_timeout": 30,
+    }
+    if ca_certs:
+        client_kwargs["ca_certs"] = ca_certs
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    elif username or password:
+        if not username or not password:
+            raise RuntimeError(
+                "Provide both ELASTICSEARCH_USERNAME and ELASTICSEARCH_PASSWORD, or use ELASTICSEARCH_API_KEY."
+            )
+        client_kwargs["basic_auth"] = (username, password)
+
+    client = Elasticsearch(**client_kwargs)
+    return client, url, index_name, verify_certs
+
+
+def build_elasticsearch_index_config() -> dict[str, Any]:
+    return {
+        "settings": {},
+        "mappings": {
+            "properties": {
+                "chunk_id": {"type": "keyword"},
+                "doc_id": {"type": "keyword"},
+                "chunk_order": {"type": "integer"},
+                "chunk_type": {"type": "keyword"},
+                "content_modality": {"type": "keyword"},
+                "document_title": {
+                    "type": "keyword",
+                    "fields": {
+                        "text": {"type": "text", "analyzer": DEFAULT_LEXICAL_ANALYZER},
+                    },
+                },
+                "section_title": {
+                    "type": "keyword",
+                    "fields": {
+                        "text": {"type": "text", "analyzer": DEFAULT_LEXICAL_ANALYZER},
+                    },
+                },
+                "heading_path_text": {"type": "text", "analyzer": DEFAULT_LEXICAL_ANALYZER},
+                "heading_path": {"type": "keyword"},
+                "page_start": {"type": "integer"},
+                "page_end": {"type": "integer"},
+                "prev_chunk_id": {"type": "keyword"},
+                "next_chunk_id": {"type": "keyword"},
+                "display_text": {"type": "text", "index": False},
+                "embedding_text": {"type": "text", "analyzer": DEFAULT_LEXICAL_ANALYZER},
+                "indexable": {"type": "boolean"},
+                "source_block_ids": {"type": "keyword"},
+                "source_marker_block_ids": {"type": "keyword"},
+            }
+        },
+    }
+
+
+def ensure_elasticsearch_index(
+    client: Elasticsearch,
+    *,
+    index_name: str,
+) -> bool:
+    if client.indices.exists(index=index_name):
+        return False
+    config = build_elasticsearch_index_config()
+    client.indices.create(index=index_name, settings=config["settings"], mappings=config["mappings"])
+    return True
+
+
+def milvus_page_to_optional(value: Any) -> int | None:
+    if value in (None, "", PAGE_NULL_SENTINEL):
+        return None
+    return int(value)
+
+
+def build_elasticsearch_document(prepared_chunk: PreparedChunk) -> dict[str, Any]:
+    row = prepared_chunk.insert_row
+    metadata = row.get(METADATA_FIELD) if isinstance(row.get(METADATA_FIELD), dict) else {}
+    heading_path = [str(item) for item in metadata.get("heading_path") or [] if str(item).strip()]
+
+    return {
+        "chunk_id": str(row[PRIMARY_KEY_FIELD]),
+        "doc_id": str(row.get("doc_id") or ""),
+        "chunk_order": int(row.get("chunk_order") or 0),
+        "chunk_type": str(row.get("chunk_type") or ""),
+        "content_modality": str(row.get("content_modality") or ""),
+        "document_title": str(row.get("document_title") or ""),
+        "section_title": str(row.get("section_title") or ""),
+        "heading_path_text": str(row.get("heading_path_text") or ""),
+        "heading_path": heading_path,
+        "page_start": milvus_page_to_optional(row.get("page_start")),
+        "page_end": milvus_page_to_optional(row.get("page_end")),
+        "prev_chunk_id": str(row.get("prev_chunk_id") or ""),
+        "next_chunk_id": str(row.get("next_chunk_id") or ""),
+        "display_text": str(row.get("display_text") or ""),
+        "embedding_text": str(row.get("embedding_text") or ""),
+        "indexable": bool(row.get("indexable")),
+        "source_block_ids": list(metadata.get("source_block_ids") or []),
+        "source_marker_block_ids": list(metadata.get("source_marker_block_ids") or []),
+    }
+
+
+def delete_existing_elasticsearch_doc_rows(
+    client: Elasticsearch,
+    *,
+    index_name: str,
+    doc_id: str,
+) -> int:
+    if not client.indices.exists(index=index_name):
+        return 0
+    response = client.delete_by_query(
+        index=index_name,
+        query={"term": {"doc_id": doc_id}},
+        conflicts="proceed",
+        refresh=True,
+    )
+    return int(response.get("deleted") or 0)
+
+
+def index_lexical_chunks(
+    client: Elasticsearch,
+    *,
+    index_name: str,
+    prepared_chunks: list[PreparedChunk],
+    batch_size: int,
+    debug: bool,
+) -> tuple[int, int]:
+    inserted = 0
+    failures = 0
+    for batch_number, batch in enumerate(batched(prepared_chunks, batch_size), start=1):
+        actions = [
+            {
+                "_op_type": "index",
+                "_index": index_name,
+                "_id": chunk.chunk_id,
+                "_source": build_elasticsearch_document(chunk),
+            }
+            for chunk in batch
+        ]
+        success_count, errors = elasticsearch_helpers.bulk(
+            client,
+            actions,
+            raise_on_error=False,
+            refresh="wait_for",
+        )
+        inserted += int(success_count)
+        failures += len(errors)
+        if debug:
+            print(
+                f"[phase03] Indexed lexical batch {batch_number} with {success_count} chunks.",
+                file=sys.stderr,
+                flush=True,
+            )
+        if errors:
+            sample_error = json.dumps(errors[:1], ensure_ascii=False)
+            raise RuntimeError(
+                f"Elasticsearch bulk indexing failed for {len(errors)} chunks in batch {batch_number}. "
+                f"Sample error: {sample_error}"
+            )
+    return inserted, failures
 
 
 def ensure_server_milvus_uri(uri: str) -> None:
@@ -807,14 +1036,27 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
 
     inserted_chunk_count = 0
     deleted_chunk_count = 0
+    inserted_lexical_chunk_count = 0
+    deleted_existing_lexical_doc_count = 0
+    lexical_bulk_failure_count = 0
     created_collection = False
+    created_elasticsearch_index = False
     vector_dim: int | None = None
     milvus_client: MilvusClient | None = None
     milvus_uri: str | None = None
     local_milvus = False
     milvus_db_name: str | None = None
+    elasticsearch_client: Elasticsearch | None = None
+    elasticsearch_url: str | None = None
+    elasticsearch_index_name: str | None = None
+    elasticsearch_verify_certs = True
 
     try:
+        milvus_client, milvus_uri, local_milvus, milvus_db_name = build_milvus_client(cfg, env_values)
+        elasticsearch_client, elasticsearch_url, elasticsearch_index_name, elasticsearch_verify_certs = (
+            build_elasticsearch_client(cfg, env_values)
+        )
+
         if prepared_chunks:
             print(
                 f"[phase03] Embedding {len(prepared_chunks)} indexable semantic chunks...",
@@ -830,16 +1072,24 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             if vector_dim is None:
                 raise RuntimeError("Phase-03 did not produce any embedding vectors.")
 
-            milvus_client, milvus_uri, local_milvus, milvus_db_name = build_milvus_client(cfg, env_values)
             created_collection = ensure_collection(
                 milvus_client,
                 collection_name=collection_name,
                 vector_dim=vector_dim,
                 debug=cfg.debug,
             )
+            created_elasticsearch_index = ensure_elasticsearch_index(
+                elasticsearch_client,
+                index_name=elasticsearch_index_name,
+            )
             deleted_chunk_count = delete_existing_doc_rows(
                 milvus_client,
                 collection_name=collection_name,
+                doc_id=doc_id,
+            )
+            deleted_existing_lexical_doc_count = delete_existing_elasticsearch_doc_rows(
+                elasticsearch_client,
+                index_name=elasticsearch_index_name,
                 doc_id=doc_id,
             )
             inserted_chunk_count = insert_chunks(
@@ -849,18 +1099,34 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
                 batch_size=cfg.embedding_batch_size,
                 debug=cfg.debug,
             )
+            inserted_lexical_chunk_count, lexical_bulk_failure_count = index_lexical_chunks(
+                elasticsearch_client,
+                index_name=elasticsearch_index_name,
+                prepared_chunks=prepared_chunks,
+                batch_size=cfg.embedding_batch_size,
+                debug=cfg.debug,
+            )
         else:
-            milvus_uri = resolve_milvus_uri(cfg, env_values)
-            local_milvus = is_local_milvus_uri(milvus_uri)
-            if local_milvus:
-                ensure_server_milvus_uri(milvus_uri)
-            milvus_db_name = None if local_milvus else cfg.milvus_db_name or env_values.get("MILVUS_DB_NAME")
+            if milvus_client.has_collection(collection_name=collection_name):
+                deleted_chunk_count = delete_existing_doc_rows(
+                    milvus_client,
+                    collection_name=collection_name,
+                    doc_id=doc_id,
+                )
+            deleted_existing_lexical_doc_count = delete_existing_elasticsearch_doc_rows(
+                elasticsearch_client,
+                index_name=elasticsearch_index_name,
+                doc_id=doc_id,
+            )
     finally:
         if milvus_client is not None:
             try:
                 milvus_client.close()
             except Exception:
                 pass
+        if elasticsearch_client is not None:
+            with suppress(Exception):
+                elasticsearch_client.close()
 
     print("[phase03] Writing enriched chunks and manifest...", file=sys.stderr, flush=True)
     write_jsonl(enriched_chunks_path, enriched_rows)
@@ -898,6 +1164,16 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "vector_index_build_params": dict(VECTOR_INDEX_BUILD_PARAMS),
             "created_collection": created_collection,
         },
+        "elasticsearch": {
+            "url": sanitize_elasticsearch_url(
+                elasticsearch_url or resolve_elasticsearch_url(cfg, env_values)
+            ),
+            "index_name": elasticsearch_index_name or resolve_elasticsearch_index_name(cfg, env_values),
+            "verify_certs": elasticsearch_verify_certs,
+            "analyzer": DEFAULT_LEXICAL_ANALYZER,
+            "created_index": created_elasticsearch_index,
+            "document_id_field": PRIMARY_KEY_FIELD,
+        },
         "artifacts": {
             "source_semantic_chunks": str(semantic_chunks_path),
             "enriched_chunks": str(enriched_chunks_path),
@@ -907,6 +1183,9 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "indexable_chunk_count": sum(1 for row in semantic_chunks if row["indexable"]),
             "inserted_chunk_count": inserted_chunk_count,
             "deleted_existing_chunk_count": deleted_chunk_count,
+            "indexed_lexical_chunk_count": inserted_lexical_chunk_count,
+            "deleted_existing_lexical_doc_count": deleted_existing_lexical_doc_count,
+            "lexical_bulk_failure_count": lexical_bulk_failure_count,
             "skipped_non_indexable_chunk_count": sum(1 for row in semantic_chunks if not row["indexable"]),
         },
     }
@@ -922,7 +1201,9 @@ def main() -> int:
             {
                 "doc_id": manifest["doc_id"],
                 "inserted_chunk_count": manifest["stats"]["inserted_chunk_count"],
+                "indexed_lexical_chunk_count": manifest["stats"]["indexed_lexical_chunk_count"],
                 "collection_name": manifest["milvus"]["collection_name"],
+                "elasticsearch_index_name": manifest["elasticsearch"]["index_name"],
                 "enriched_chunks": manifest["artifacts"]["enriched_chunks"],
             },
             ensure_ascii=False,

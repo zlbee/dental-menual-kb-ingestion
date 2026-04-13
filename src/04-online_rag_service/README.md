@@ -1,23 +1,21 @@
 # Phase 04: Online RAG Service
 
-This stage serves hybrid retrieval for the AI assistant on top of the
-phase-03 Milvus collection.
+This stage serves hybrid retrieval for the AI assistant on top of phase-03
+Milvus vectors and Elasticsearch lexical documents.
 
 ## Retrieval Design
 
-Phase 04 reads its corpus from Milvus only.
+Phase 04 reads dense vectors and response metadata from Milvus, and reads
+lexical recall candidates from Elasticsearch.
 
-At startup it loads the `indexable` rows from the Milvus collection and builds
-two in-memory BM25 indexes:
+At startup it loads the `indexable` rows from the Milvus collection for
+neighbor lookup, result shaping, and reranking.
 
-- `embedding_text` for the primary lexical recall lane
-- `metadata.heading_path` for a lighter heading-aware lexical lane
-
-At query time the service runs three first-stage retrieval lanes in parallel:
+At query time the service runs three first-stage retrieval lanes:
 
 - dense vector recall against Milvus `embedding` using `OPENAI_RECALL_MODEL`
-- BM25 over `embedding_text`
-- BM25 over `metadata.heading_path`
+- Elasticsearch BM25 over `embedding_text`
+- Elasticsearch BM25 over `heading_path_text`
 
 The three lanes are fused with weighted reciprocal rank fusion (RRF), then the
 candidate set is reranked with exact cosine similarity using
@@ -25,17 +23,25 @@ candidate set is reranked with exact cosine similarity using
 
 ## Data Contract
 
-Phase 04 expects the phase-03 collection schema defined in:
+Phase 04 expects:
 
-- `src/03-vectorization/pipeline.py`
+- the phase-03 Milvus collection schema defined in `src/03-vectorization/pipeline.py`
+- the phase-03 Elasticsearch lexical index published by the same pipeline
 
-It uses these fields:
+It reads these Milvus fields:
 
 - scalar fields: `chunk_id`, `doc_id`, `chunk_type`, `content_modality`,
   `document_title`, `section_title`, `page_start`, `page_end`,
   `prev_chunk_id`, `next_chunk_id`, `display_text`, `embedding_text`
 - JSON field: `metadata`
 - vector field: `embedding`
+
+It queries these Elasticsearch fields:
+
+- `embedding_text`
+- `heading_path_text`
+- `doc_id`, `chunk_type`, `content_modality`, `document_title`,
+  `section_title`, `page_start`, `page_end`, `indexable`
 
 The response also exposes citation-friendly metadata such as:
 
@@ -83,15 +89,30 @@ Milvus settings follow the same convention as phase 03:
 If `MILVUS_URI` is not set, phase 04 defaults to the local Milvus standalone
 endpoint at `http://localhost:19530`.
 
+Elasticsearch settings:
+
+- `ELASTICSEARCH_URL`
+- `ELASTICSEARCH_INDEX_NAME`
+- `ELASTICSEARCH_USERNAME`
+- `ELASTICSEARCH_PASSWORD`
+- `ELASTICSEARCH_API_KEY`
+- `ELASTICSEARCH_VERIFY_CERTS`
+- `ELASTICSEARCH_CA_CERT_PATH`
+
+If `ELASTICSEARCH_URL` is not set, phase 04 defaults to `http://localhost:9200`.
+
 ## Local Run
 
 From the repo root:
 
 ```powershell
-docker compose up -d milvus-standalone
+docker compose up -d milvus-standalone elasticsearch kibana
 
 python src/04-online_rag_service/server.py
 ```
+
+When Kibana is running, open `http://localhost:5601` to inspect the
+Elasticsearch lexical index.
 
 Or with Uvicorn:
 
@@ -109,11 +130,13 @@ docker compose up phase04
 
 ## Notes
 
-- `POST /reload` refreshes the in-memory BM25 indexes from Milvus so the
-  service can pick up newly ingested phase-03 rows without a restart.
+- `POST /reload` refreshes the in-memory Milvus row cache and reports the
+  current Elasticsearch lexical document count.
 - The service returns both `display_text` and `retrieval_text`
   (`embedding_text`) so the downstream assistant can choose between
   presentation text and retrieval-optimized text.
 - Phase 04 assumes the phase-03 vectors live in Milvus standalone/server
   because phase 03 now builds an `HNSW` index. In Docker Compose, `phase04`
   defaults to `http://milvus-standalone:19530`.
+- In Docker Compose, `phase04` defaults to `http://elasticsearch:9200` for
+  lexical retrieval.

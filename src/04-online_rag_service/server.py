@@ -11,24 +11,26 @@ import threading
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 import numpy as np
 import uvicorn
+from elasticsearch import Elasticsearch
 from fastapi import FastAPI, HTTPException, Request
 from langchain_openai import OpenAIEmbeddings
 from pydantic import BaseModel, ConfigDict, Field
 from pymilvus import MilvusClient
 from pymilvus.exceptions import MilvusException
-from rank_bm25 import BM25Okapi
 from starlette.concurrency import run_in_threadpool
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PHASE03_ROOT = REPO_ROOT / "data" / "processed" / "03_vectorization"
 DEFAULT_STANDALONE_MILVUS_URI = "http://localhost:19530"
+DEFAULT_STANDALONE_ELASTICSEARCH_URL = "http://localhost:9200"
 DEFAULT_COLLECTION_PREFIX = "dental_kb_v1"
+DEFAULT_LEXICAL_ANALYZER = "english"
 VECTOR_FIELD_NAME = "embedding"
 PRIMARY_KEY_FIELD = "chunk_id"
 METADATA_FIELD = "metadata"
@@ -89,6 +91,8 @@ class RuntimeConfig:
     milvus_db_name: str | None
     collection_name: str | None
     collection_prefix: str
+    elasticsearch_url: str | None
+    elasticsearch_index_name: str | None
     host: str
     port: int
     dense_top_k: int
@@ -128,10 +132,7 @@ class ChunkRecord:
 class RetrievalIndex:
     rows: tuple[ChunkRecord, ...]
     row_by_chunk_id: dict[str, ChunkRecord]
-    body_bm25: BM25Okapi | None
-    heading_bm25: BM25Okapi | None
-    body_placeholder_rows: frozenset[int]
-    heading_placeholder_rows: frozenset[int]
+    elasticsearch_doc_count: int | None
     loaded_at_utc: str
 
 
@@ -188,8 +189,8 @@ class RetrieveRequest(BaseModel):
 def parse_args() -> RuntimeConfig:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the phase-04 online RAG service with Milvus-backed dense recall, "
-            "BM25 lexical recall, and embedding reranking."
+            "Run the phase-04 online RAG service with Milvus dense recall, "
+            "Elasticsearch BM25 lexical recall, and embedding reranking."
         )
     )
     parser.add_argument(
@@ -234,6 +235,18 @@ def parse_args() -> RuntimeConfig:
         default=DEFAULT_COLLECTION_PREFIX,
         help="Fallback collection prefix when MILVUS_COLLECTION_NAME is unset.",
     )
+    parser.add_argument(
+        "--elasticsearch-url",
+        type=str,
+        default=None,
+        help="Optional Elasticsearch URL. Defaults to ELASTICSEARCH_URL or http://localhost:9200.",
+    )
+    parser.add_argument(
+        "--elasticsearch-index-name",
+        type=str,
+        default=None,
+        help="Optional explicit Elasticsearch lexical index name.",
+    )
     parser.add_argument("--host", type=str, default=DEFAULT_HOST, help="Bind host for the HTTP service.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Bind port for the HTTP service.")
     parser.add_argument(
@@ -246,13 +259,13 @@ def parse_args() -> RuntimeConfig:
         "--lexical-top-k",
         type=int,
         default=DEFAULT_LEXICAL_TOP_K,
-        help="Default top-k used for BM25 recall over embedding_text.",
+        help="Default top-k used for Elasticsearch BM25 recall over embedding_text.",
     )
     parser.add_argument(
         "--heading-top-k",
         type=int,
         default=DEFAULT_HEADING_TOP_K,
-        help="Default top-k used for BM25 recall over metadata.heading_path.",
+        help="Default top-k used for Elasticsearch BM25 recall over heading_path_text.",
     )
     parser.add_argument(
         "--candidate-pool-size",
@@ -282,13 +295,13 @@ def parse_args() -> RuntimeConfig:
         "--body-weight",
         type=float,
         default=DEFAULT_BODY_WEIGHT,
-        help="Weighted RRF contribution for BM25 over embedding_text.",
+        help="Weighted RRF contribution for Elasticsearch BM25 over embedding_text.",
     )
     parser.add_argument(
         "--heading-weight",
         type=float,
         default=DEFAULT_HEADING_WEIGHT,
-        help="Weighted RRF contribution for BM25 over metadata.heading_path.",
+        help="Weighted RRF contribution for Elasticsearch BM25 over heading_path_text.",
     )
     parser.add_argument(
         "--rerank-fusion-boost",
@@ -311,6 +324,8 @@ def parse_args() -> RuntimeConfig:
         milvus_db_name=args.milvus_db_name,
         collection_name=args.collection_name,
         collection_prefix=args.collection_prefix,
+        elasticsearch_url=args.elasticsearch_url,
+        elasticsearch_index_name=args.elasticsearch_index_name,
         host=args.host,
         port=args.port,
         dense_top_k=args.dense_top_k,
@@ -336,6 +351,8 @@ def default_runtime_config() -> RuntimeConfig:
         milvus_db_name=None,
         collection_name=None,
         collection_prefix=DEFAULT_COLLECTION_PREFIX,
+        elasticsearch_url=None,
+        elasticsearch_index_name=None,
         host=DEFAULT_HOST,
         port=DEFAULT_PORT,
         dense_top_k=DEFAULT_DENSE_TOP_K,
@@ -376,6 +393,17 @@ def merged_env(extra_env: dict[str, str]) -> dict[str, str]:
     merged = dict(os.environ)
     merged.update(extra_env)
     return merged
+
+
+def env_flag(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Could not parse boolean environment value: {value!r}")
 
 
 def slugify(value: str) -> str:
@@ -431,6 +459,62 @@ def resolve_collection_name(cfg: RuntimeConfig, env_values: dict[str, str]) -> s
     prefix = env_values.get("MILVUS_COLLECTION_PREFIX") or cfg.collection_prefix
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
     return f"{slugify(prefix)}_{slugify(embedding_model)}"
+
+
+def resolve_elasticsearch_url(cfg: RuntimeConfig, env_values: dict[str, str]) -> str:
+    if cfg.elasticsearch_url:
+        return cfg.elasticsearch_url
+    if env_values.get("ELASTICSEARCH_URL"):
+        return env_values["ELASTICSEARCH_URL"]
+    return DEFAULT_STANDALONE_ELASTICSEARCH_URL
+
+
+def sanitize_elasticsearch_url(url: str) -> str:
+    parsed = urlsplit(url if "://" in url else f"http://{url}")
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    sanitized = urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+    return sanitized if "://" in url else sanitized.removeprefix("http://")
+
+
+def resolve_elasticsearch_index_name(cfg: RuntimeConfig, env_values: dict[str, str]) -> str:
+    explicit_name = cfg.elasticsearch_index_name or env_values.get("ELASTICSEARCH_INDEX_NAME")
+    if explicit_name:
+        return explicit_name
+    return f"{resolve_collection_name(cfg, env_values)}_lexical"
+
+
+def build_elasticsearch_client(
+    cfg: RuntimeConfig,
+    env_values: dict[str, str],
+) -> tuple[Elasticsearch, str, str, bool]:
+    url = resolve_elasticsearch_url(cfg, env_values)
+    index_name = resolve_elasticsearch_index_name(cfg, env_values)
+    verify_certs = env_flag(env_values.get("ELASTICSEARCH_VERIFY_CERTS"), default=True)
+    username = env_values.get("ELASTICSEARCH_USERNAME")
+    password = env_values.get("ELASTICSEARCH_PASSWORD")
+    api_key = env_values.get("ELASTICSEARCH_API_KEY")
+    ca_certs = env_values.get("ELASTICSEARCH_CA_CERT_PATH")
+
+    client_kwargs: dict[str, Any] = {
+        "hosts": [url],
+        "verify_certs": verify_certs,
+        "request_timeout": 30,
+    }
+    if ca_certs:
+        client_kwargs["ca_certs"] = ca_certs
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    elif username or password:
+        if not username or not password:
+            raise RuntimeError(
+                "Provide both ELASTICSEARCH_USERNAME and ELASTICSEARCH_PASSWORD, or use ELASTICSEARCH_API_KEY."
+            )
+        client_kwargs["basic_auth"] = (username, password)
+
+    client = Elasticsearch(**client_kwargs)
+    return client, url, index_name, verify_certs
 
 
 def ensure_server_milvus_uri(uri: str) -> None:
@@ -535,13 +619,6 @@ def parse_page(value: Any) -> int | None:
     return None if page == PAGE_NULL_SENTINEL else page
 
 
-def tokenize(text: str) -> list[str]:
-    if not text:
-        return []
-    tokens = re.findall(r"[0-9A-Za-z]+|[\u4e00-\u9fff]+", text.lower())
-    return [token for token in tokens if token]
-
-
 def heading_path_text_from_metadata(metadata: dict[str, Any], fallback: str | None = None) -> str:
     raw_heading_path = metadata.get("heading_path")
     if isinstance(raw_heading_path, list):
@@ -578,66 +655,10 @@ def build_chunk_record(raw_row: dict[str, Any]) -> ChunkRecord:
         heading_path_text=heading_path_text,
     )
 
-
-def build_bm25_index(texts: Sequence[str]) -> tuple[BM25Okapi | None, frozenset[int]]:
-    tokenized_rows: list[list[str]] = []
-    placeholder_rows: set[int] = set()
-    has_real_tokens = False
-
-    for index, text in enumerate(texts):
-        tokens = tokenize(text)
-        if tokens:
-            has_real_tokens = True
-            tokenized_rows.append(tokens)
-            continue
-        placeholder_rows.add(index)
-        tokenized_rows.append(["__empty__"])
-
-    if not has_real_tokens:
-        return None, frozenset(placeholder_rows)
-    return BM25Okapi(tokenized_rows), frozenset(placeholder_rows)
-
-
 def normalize_filter_values(values: list[str] | None) -> list[str]:
     if not values:
         return []
     return [item.strip() for item in values if item and item.strip()]
-
-
-def build_filter_predicate(filters: RetrievalFilters | None) -> Callable[[ChunkRecord], bool]:
-    if filters is None:
-        return lambda _: True
-
-    doc_ids = set(normalize_filter_values(filters.doc_ids))
-    chunk_types = set(normalize_filter_values(filters.chunk_types))
-    content_modalities = set(normalize_filter_values(filters.content_modalities))
-    document_titles = set(normalize_filter_values(filters.document_titles))
-    section_titles = set(normalize_filter_values(filters.section_titles))
-    page_from = filters.page_from
-    page_to = filters.page_to
-
-    def predicate(row: ChunkRecord) -> bool:
-        if doc_ids and row.doc_id not in doc_ids:
-            return False
-        if chunk_types and row.chunk_type not in chunk_types:
-            return False
-        if content_modalities and row.content_modality not in content_modalities:
-            return False
-        if document_titles and (row.document_title or "") not in document_titles:
-            return False
-        if section_titles and (row.section_title or "") not in section_titles:
-            return False
-        if page_from is not None:
-            row_end = row.page_end if row.page_end is not None else row.page_start
-            if row_end is None or row_end < page_from:
-                return False
-        if page_to is not None:
-            row_start = row.page_start if row.page_start is not None else row.page_end
-            if row_start is None or row_start > page_to:
-                return False
-        return True
-
-    return predicate
 
 
 def build_milvus_filter(filters: RetrievalFilters | None) -> str:
@@ -668,39 +689,76 @@ def build_milvus_filter(filters: RetrievalFilters | None) -> str:
             f"section_title in {json.dumps(sorted(section_titles), ensure_ascii=False)}"
         )
     if filters.page_from is not None:
-        clauses.append(f"page_end >= {int(filters.page_from)}")
+        clauses.append(
+            f"(page_end >= {int(filters.page_from)} or (page_end == {PAGE_NULL_SENTINEL} and page_start >= {int(filters.page_from)}))"
+        )
     if filters.page_to is not None:
-        clauses.append(f"page_start <= {int(filters.page_to)}")
+        clauses.append(
+            f"(page_start <= {int(filters.page_to)} or (page_start == {PAGE_NULL_SENTINEL} and page_end <= {int(filters.page_to)}))"
+        )
     return " and ".join(clauses)
 
 
-def top_k_bm25_hits(
-    bm25: BM25Okapi | None,
-    placeholder_rows: frozenset[int],
-    rows: Sequence[ChunkRecord],
-    *,
-    query_tokens: list[str],
-    top_k: int,
-    predicate: Callable[[ChunkRecord], bool],
-) -> list[LaneHit]:
-    if bm25 is None or not query_tokens or top_k <= 0:
-        return []
+def build_elasticsearch_page_from_filter(page_from: int) -> dict[str, Any]:
+    return {
+        "bool": {
+            "should": [
+                {"range": {"page_end": {"gte": int(page_from)}}},
+                {
+                    "bool": {
+                        "must_not": [{"exists": {"field": "page_end"}}],
+                        "filter": [{"range": {"page_start": {"gte": int(page_from)}}}],
+                    }
+                },
+            ],
+            "minimum_should_match": 1,
+        }
+    }
 
-    raw_scores = np.asarray(bm25.get_scores(query_tokens), dtype=float)
-    scored_indices: list[tuple[int, float]] = []
-    for index, score in enumerate(raw_scores):
-        if index in placeholder_rows or score <= 0.0:
-            continue
-        row = rows[index]
-        if not predicate(row):
-            continue
-        scored_indices.append((index, float(score)))
 
-    scored_indices.sort(key=lambda item: item[1], reverse=True)
-    return [
-        LaneHit(chunk_id=rows[index].chunk_id, rank=rank, raw_score=score)
-        for rank, (index, score) in enumerate(scored_indices[:top_k], start=1)
-    ]
+def build_elasticsearch_page_to_filter(page_to: int) -> dict[str, Any]:
+    return {
+        "bool": {
+            "should": [
+                {"range": {"page_start": {"lte": int(page_to)}}},
+                {
+                    "bool": {
+                        "must_not": [{"exists": {"field": "page_start"}}],
+                        "filter": [{"range": {"page_end": {"lte": int(page_to)}}}],
+                    }
+                },
+            ],
+            "minimum_should_match": 1,
+        }
+    }
+
+
+def build_elasticsearch_filter_clauses(filters: RetrievalFilters | None) -> list[dict[str, Any]]:
+    clauses: list[dict[str, Any]] = [{"term": {"indexable": True}}]
+    if filters is None:
+        return clauses
+
+    doc_ids = normalize_filter_values(filters.doc_ids)
+    chunk_types = normalize_filter_values(filters.chunk_types)
+    content_modalities = normalize_filter_values(filters.content_modalities)
+    document_titles = normalize_filter_values(filters.document_titles)
+    section_titles = normalize_filter_values(filters.section_titles)
+
+    if doc_ids:
+        clauses.append({"terms": {"doc_id": sorted(doc_ids)}})
+    if chunk_types:
+        clauses.append({"terms": {"chunk_type": sorted(chunk_types)}})
+    if content_modalities:
+        clauses.append({"terms": {"content_modality": sorted(content_modalities)}})
+    if document_titles:
+        clauses.append({"terms": {"document_title": sorted(document_titles)}})
+    if section_titles:
+        clauses.append({"terms": {"section_title": sorted(section_titles)}})
+    if filters.page_from is not None:
+        clauses.append(build_elasticsearch_page_from_filter(filters.page_from))
+    if filters.page_to is not None:
+        clauses.append(build_elasticsearch_page_to_filter(filters.page_to))
+    return clauses
 
 
 def ensure_cosine_vector(vector: Sequence[float], *, expected_dim: int | None = None) -> np.ndarray:
@@ -728,6 +786,12 @@ class OnlineRAGService:
         self.cfg = cfg
         self.env_values = env_values
         self.collection_name = resolve_collection_name(cfg, env_values)
+        (
+            self.elasticsearch_client,
+            self.elasticsearch_url,
+            self.elasticsearch_index_name,
+            self.elasticsearch_verify_certs,
+        ) = build_elasticsearch_client(cfg, env_values)
         self.client, self.milvus_uri, self.local_milvus, self.milvus_db_name = build_milvus_client(
             cfg, env_values
         )
@@ -743,11 +807,14 @@ class OnlineRAGService:
             )
         self._state_lock = threading.RLock()
         self._milvus_lock = threading.RLock()
+        self._elasticsearch_lock = threading.RLock()
         self._index: RetrievalIndex | None = None
 
     def close(self) -> None:
         with suppress(Exception):
             self.client.close()
+        with suppress(Exception):
+            self.elasticsearch_client.close()
 
     def config_snapshot(self) -> dict[str, Any]:
         return {
@@ -758,6 +825,12 @@ class OnlineRAGService:
                 "collection_name": self.collection_name,
                 "vector_field": VECTOR_FIELD_NAME,
                 "vector_dim": self.vector_dim,
+            },
+            "elasticsearch": {
+                "url": sanitize_elasticsearch_url(self.elasticsearch_url),
+                "index_name": self.elasticsearch_index_name,
+                "verify_certs": self.elasticsearch_verify_certs,
+                "analyzer": DEFAULT_LEXICAL_ANALYZER,
             },
             "models": {
                 "recall": self.recall_model,
@@ -780,10 +853,22 @@ class OnlineRAGService:
     def health(self) -> dict[str, Any]:
         with self._state_lock:
             index = self._index
+        elasticsearch_ok = self._ping_elasticsearch()
         return {
             "status": "ok" if index is not None else "loading",
             "loaded_chunk_count": len(index.rows) if index is not None else 0,
             "loaded_at_utc": index.loaded_at_utc if index is not None else None,
+            "backends": {
+                "milvus": {
+                    "ready": index is not None,
+                    "collection_name": self.collection_name,
+                },
+                "elasticsearch": {
+                    "ready": elasticsearch_ok,
+                    "index_name": self.elasticsearch_index_name,
+                    "doc_count": index.elasticsearch_doc_count if index is not None else None,
+                },
+            },
             "config": self.config_snapshot(),
         }
 
@@ -815,20 +900,19 @@ class OnlineRAGService:
                 f"Milvus collection {self.collection_name} did not return any indexable rows."
             )
 
-        body_bm25, body_placeholder_rows = build_bm25_index(
-            [row.embedding_text for row in rows]
-        )
-        heading_bm25, heading_placeholder_rows = build_bm25_index(
-            [row.heading_path_text for row in rows]
-        )
+        elasticsearch_doc_count = self._count_elasticsearch_docs()
+        if elasticsearch_doc_count is not None and elasticsearch_doc_count != len(rows):
+            logger.warning(
+                "Elasticsearch lexical doc count (%s) does not match Milvus row count (%s) for %s.",
+                elasticsearch_doc_count,
+                len(rows),
+                self.collection_name,
+            )
 
         index = RetrievalIndex(
             rows=tuple(rows),
             row_by_chunk_id={row.chunk_id: row for row in rows},
-            body_bm25=body_bm25,
-            heading_bm25=heading_bm25,
-            body_placeholder_rows=body_placeholder_rows,
-            heading_placeholder_rows=heading_placeholder_rows,
+            elasticsearch_doc_count=elasticsearch_doc_count,
             loaded_at_utc=dt.datetime.now(dt.UTC).isoformat(),
         )
 
@@ -838,6 +922,7 @@ class OnlineRAGService:
         return {
             "status": "reloaded",
             "loaded_chunk_count": len(index.rows),
+            "elasticsearch_doc_count": index.elasticsearch_doc_count,
             "loaded_at_utc": index.loaded_at_utc,
             "config": self.config_snapshot(),
         }
@@ -876,6 +961,24 @@ class OnlineRAGService:
         if index is None:
             raise RuntimeError("Retrieval index is not loaded yet.")
         return index
+
+    def _ping_elasticsearch(self) -> bool:
+        with self._elasticsearch_lock:
+            try:
+                return bool(self.elasticsearch_client.ping())
+            except Exception:
+                return False
+
+    def _count_elasticsearch_docs(self) -> int | None:
+        with self._elasticsearch_lock:
+            try:
+                response = self.elasticsearch_client.count(
+                    index=self.elasticsearch_index_name,
+                    query={"term": {"indexable": True}},
+                )
+            except Exception:
+                return None
+        return int(response.get("count") or 0)
 
     def _embed_query(self, query: str, *, for_rerank: bool) -> np.ndarray:
         embeddings = self.rerank_embeddings if for_rerank else self.recall_embeddings
@@ -929,6 +1032,59 @@ class OnlineRAGService:
             )
         return dense_hits
 
+    def _lexical_search(
+        self,
+        *,
+        field_name: str,
+        query: str,
+        top_k: int,
+        filters: RetrievalFilters | None,
+    ) -> list[LaneHit]:
+        if top_k <= 0:
+            return []
+
+        payload = {
+            "size": top_k,
+            "track_total_hits": False,
+            "_source": False,
+            "query": {
+                "bool": {
+                    "must": [
+                        {
+                            "match": {
+                                field_name: {
+                                    "query": query,
+                                }
+                            }
+                        }
+                    ],
+                    "filter": build_elasticsearch_filter_clauses(filters),
+                }
+            },
+        }
+
+        with self._elasticsearch_lock:
+            response = self.elasticsearch_client.search(
+                index=self.elasticsearch_index_name,
+                body=payload,
+            )
+
+        hits = response.get("hits", {}).get("hits", [])
+        lexical_hits: list[LaneHit] = []
+        for rank, hit in enumerate(hits, start=1):
+            chunk_id = hit.get("_id")
+            if chunk_id is None:
+                continue
+            raw_score = hit.get("_score")
+            lexical_hits.append(
+                LaneHit(
+                    chunk_id=str(chunk_id),
+                    rank=rank,
+                    raw_score=float(raw_score) if raw_score is not None else None,
+                )
+            )
+        return lexical_hits
+
     def _fetch_candidate_vectors(self, chunk_ids: list[str]) -> dict[str, Sequence[float]]:
         if not chunk_ids:
             return {}
@@ -966,34 +1122,45 @@ class OnlineRAGService:
         candidate_pool_size = request.candidate_pool_size or self.cfg.candidate_pool_size
         candidate_pool_size = max(candidate_pool_size, top_k)
 
-        filter_predicate = build_filter_predicate(request.filters)
         milvus_filter = build_milvus_filter(request.filters)
         started_at = time.perf_counter()
 
         recall_query_vector = self._embed_query(query, for_rerank=False)
+        dense_started_at = time.perf_counter()
         dense_hits = self._dense_search(
             recall_query_vector,
             milvus_filter=milvus_filter,
             top_k=dense_top_k,
         )
+        dense_took_ms = round((time.perf_counter() - dense_started_at) * 1000, 2)
 
-        query_tokens = tokenize(query)
-        body_hits = top_k_bm25_hits(
-            index.body_bm25,
-            index.body_placeholder_rows,
-            index.rows,
-            query_tokens=query_tokens,
+        body_started_at = time.perf_counter()
+        body_hits = self._lexical_search(
+            field_name="embedding_text",
+            query=query,
             top_k=lexical_top_k,
-            predicate=filter_predicate,
+            filters=request.filters,
         )
-        heading_hits = top_k_bm25_hits(
-            index.heading_bm25,
-            index.heading_placeholder_rows,
-            index.rows,
-            query_tokens=query_tokens,
+        body_took_ms = round((time.perf_counter() - body_started_at) * 1000, 2)
+        heading_started_at = time.perf_counter()
+        heading_hits = self._lexical_search(
+            field_name="heading_path_text",
+            query=query,
             top_k=heading_top_k,
-            predicate=filter_predicate,
+            filters=request.filters,
         )
+        heading_took_ms = round((time.perf_counter() - heading_started_at) * 1000, 2)
+
+        if self.cfg.debug:
+            logger.info(
+                "retrieval lanes dense_ms=%s body_ms=%s heading_ms=%s dense_hits=%s body_hits=%s heading_hits=%s",
+                dense_took_ms,
+                body_took_ms,
+                heading_took_ms,
+                len(dense_hits),
+                len(body_hits),
+                len(heading_hits),
+            )
 
         fused_candidates: dict[str, CandidateScore] = {}
         self._apply_rrf_lane(
@@ -1226,7 +1393,7 @@ def create_app(cfg: RuntimeConfig) -> FastAPI:
     app = FastAPI(
         title="Dental Manual Online RAG Service",
         version="1.0.0",
-        summary="Milvus-backed hybrid retrieval service for phase-04 online RAG.",
+        summary="Milvus + Elasticsearch hybrid retrieval service for phase-04 online RAG.",
     )
 
     @app.on_event("startup")
