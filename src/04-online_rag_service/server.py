@@ -34,6 +34,7 @@ DEFAULT_STANDALONE_ELASTICSEARCH_URL = "http://localhost:9200"
 DEFAULT_COLLECTION_PREFIX = "dental_kb_v1"
 DEFAULT_LEXICAL_ANALYZER = "english"
 VECTOR_FIELD_NAME = "embedding"
+IMAGE_VECTOR_FIELD_NAME = "image_embedding"
 PRIMARY_KEY_FIELD = "chunk_id"
 METADATA_FIELD = "metadata"
 PAGE_NULL_SENTINEL = -1
@@ -42,12 +43,14 @@ VECTOR_SEARCH_PARAMS = {"ef": 128}
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
 DEFAULT_DENSE_TOP_K = 60
+DEFAULT_IMAGE_TOP_K = 40
 DEFAULT_LEXICAL_TOP_K = 60
 DEFAULT_HEADING_TOP_K = 40
 DEFAULT_CANDIDATE_POOL_SIZE = 80
 DEFAULT_FINAL_TOP_K = 8
 DEFAULT_RRF_K = 60
 DEFAULT_DENSE_WEIGHT = 0.50
+DEFAULT_IMAGE_WEIGHT = 0.25
 DEFAULT_BODY_WEIGHT = 0.35
 DEFAULT_HEADING_WEIGHT = 0.15
 DEFAULT_RERANK_FUSION_BOOST = 0.15
@@ -71,6 +74,7 @@ MILVUS_OUTPUT_FIELDS = [
     "next_chunk_id",
     "display_text",
     "embedding_text",
+    "has_image",
     METADATA_FIELD,
 ]
 SEARCH_OUTPUT_FIELDS = [PRIMARY_KEY_FIELD]
@@ -97,12 +101,14 @@ class RuntimeConfig:
     host: str
     port: int
     dense_top_k: int
+    image_top_k: int
     lexical_top_k: int
     heading_top_k: int
     candidate_pool_size: int
     final_top_k: int
     rrf_k: int
     dense_weight: float
+    image_weight: float
     body_weight: float
     heading_weight: float
     rerank_fusion_boost: float
@@ -124,6 +130,8 @@ class ChunkRecord:
     next_chunk_id: str | None
     display_text: str
     embedding_text: str
+    has_image: bool
+    media_assets: tuple[dict[str, Any], ...]
     metadata: dict[str, Any]
     heading_path: tuple[str, ...]
     heading_path_text: str
@@ -150,13 +158,17 @@ class CandidateScore:
     chunk_id: str
     fused_rrf: float = 0.0
     dense_rrf: float = 0.0
+    image_rrf: float = 0.0
     body_rrf: float = 0.0
     heading_rrf: float = 0.0
     dense_rank: int | None = None
+    image_rank: int | None = None
     body_rank: int | None = None
     heading_rank: int | None = None
     dense_raw_score: float | None = None
     dense_distance: float | None = None
+    image_raw_score: float | None = None
+    image_distance: float | None = None
     body_bm25: float | None = None
     heading_bm25: float | None = None
 
@@ -185,6 +197,7 @@ class RetrieveRequest(BaseModel):
     query: str = Field(min_length=1, max_length=4000)
     top_k: int | None = Field(default=None, ge=1, le=MAX_TOP_K)
     dense_top_k: int | None = Field(default=None, ge=1, le=MAX_RECALL_K)
+    image_top_k: int | None = Field(default=None, ge=1, le=MAX_RECALL_K)
     lexical_top_k: int | None = Field(default=None, ge=1, le=MAX_RECALL_K)
     heading_top_k: int | None = Field(default=None, ge=1, le=MAX_RECALL_K)
     candidate_pool_size: int | None = Field(default=None, ge=1, le=MAX_CANDIDATE_POOL)
@@ -263,6 +276,12 @@ def parse_args() -> RuntimeConfig:
         help="Default top-k used for first-stage dense recall.",
     )
     parser.add_argument(
+        "--image-top-k",
+        type=int,
+        default=DEFAULT_IMAGE_TOP_K,
+        help="Default top-k used for image-vector recall over visual chunks.",
+    )
+    parser.add_argument(
         "--lexical-top-k",
         type=int,
         default=DEFAULT_LEXICAL_TOP_K,
@@ -297,6 +316,12 @@ def parse_args() -> RuntimeConfig:
         type=float,
         default=DEFAULT_DENSE_WEIGHT,
         help="Weighted RRF contribution for dense recall.",
+    )
+    parser.add_argument(
+        "--image-weight",
+        type=float,
+        default=DEFAULT_IMAGE_WEIGHT,
+        help="Weighted RRF contribution for image-vector recall.",
     )
     parser.add_argument(
         "--body-weight",
@@ -336,12 +361,14 @@ def parse_args() -> RuntimeConfig:
         host=args.host,
         port=args.port,
         dense_top_k=args.dense_top_k,
+        image_top_k=args.image_top_k,
         lexical_top_k=args.lexical_top_k,
         heading_top_k=args.heading_top_k,
         candidate_pool_size=args.candidate_pool_size,
         final_top_k=args.final_top_k,
         rrf_k=args.rrf_k,
         dense_weight=args.dense_weight,
+        image_weight=args.image_weight,
         body_weight=args.body_weight,
         heading_weight=args.heading_weight,
         rerank_fusion_boost=args.rerank_fusion_boost,
@@ -363,12 +390,14 @@ def default_runtime_config() -> RuntimeConfig:
         host=DEFAULT_HOST,
         port=DEFAULT_PORT,
         dense_top_k=DEFAULT_DENSE_TOP_K,
+        image_top_k=DEFAULT_IMAGE_TOP_K,
         lexical_top_k=DEFAULT_LEXICAL_TOP_K,
         heading_top_k=DEFAULT_HEADING_TOP_K,
         candidate_pool_size=DEFAULT_CANDIDATE_POOL_SIZE,
         final_top_k=DEFAULT_FINAL_TOP_K,
         rrf_k=DEFAULT_RRF_K,
         dense_weight=DEFAULT_DENSE_WEIGHT,
+        image_weight=DEFAULT_IMAGE_WEIGHT,
         body_weight=DEFAULT_BODY_WEIGHT,
         heading_weight=DEFAULT_HEADING_WEIGHT,
         rerank_fusion_boost=DEFAULT_RERANK_FUSION_BOOST,
@@ -465,7 +494,8 @@ def resolve_collection_name(cfg: RuntimeConfig, env_values: dict[str, str]) -> s
         return explicit_name
     prefix = env_values.get("MILVUS_COLLECTION_PREFIX") or cfg.collection_prefix
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
-    return f"{slugify(prefix)}_{slugify(embedding_model)}"
+    image_embedding_model = env_values["IMAGE_EMBEDDING_MODEL"]
+    return f"{slugify(prefix)}_{slugify(embedding_model)}_{slugify(image_embedding_model)}"
 
 
 def resolve_elasticsearch_url(cfg: RuntimeConfig, env_values: dict[str, str]) -> str:
@@ -550,6 +580,70 @@ def build_embeddings(env_values: dict[str, str], *, model_env_name: str) -> Open
     )
 
 
+class ImageEmbeddingClient:
+    def __init__(self, *, base_url: str, api_key: str, model: str) -> None:
+        self.endpoint = base_url.rstrip("/") + "/embeddings"
+        self.api_key = api_key
+        self.model = model
+
+    def embed_query(self, text: str) -> list[float]:
+        payload = {
+            "model": self.model,
+            "input": [text],
+        }
+        raw_payload = json.dumps(payload).encode("utf-8")
+        request = urllib_request.Request(
+            self.endpoint,
+            data=raw_payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urllib_request.urlopen(request, timeout=60) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Image query embedding request failed with HTTP {exc.code}: {error_body}"
+            ) from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"Image query embedding request failed: {exc.reason}") from exc
+
+        data = response_payload.get("data")
+        if not isinstance(data, list) or not data:
+            raise RuntimeError(f"Unexpected image query embedding response payload: {response_payload!r}")
+        embedding = data[0].get("embedding") if isinstance(data[0], dict) else None
+        if not isinstance(embedding, list):
+            raise RuntimeError(f"Unexpected image query embedding item: {data[0]!r}")
+        return [float(value) for value in embedding]
+
+
+def resolve_image_embedding_base_url(env_values: dict[str, str]) -> str:
+    return env_values.get("IMAGE_EMBEDDING_BASE_URL") or env_values["OPENAI_BASE_URL"]
+
+
+def resolve_image_embedding_api_key(env_values: dict[str, str]) -> str:
+    return env_values.get("IMAGE_EMBEDDING_API_KEY") or env_values["OPENAI_API_KEY"]
+
+
+def build_image_embedding_client(env_values: dict[str, str]) -> ImageEmbeddingClient:
+    required = ("OPENAI_BASE_URL", "OPENAI_API_KEY", "IMAGE_EMBEDDING_MODEL")
+    missing = [key for key in required if not env_values.get(key)]
+    if missing:
+        raise RuntimeError(
+            "Phase-04 image-vector retrieval requires these env vars: " + ", ".join(sorted(missing))
+        )
+    return ImageEmbeddingClient(
+        base_url=resolve_image_embedding_base_url(env_values),
+        api_key=resolve_image_embedding_api_key(env_values),
+        model=env_values["IMAGE_EMBEDDING_MODEL"],
+    )
+
+
 def resolve_rerank_model(env_values: dict[str, str]) -> str:
     model_name = (env_values.get("OPENAI_RERANK_MODEL") or "").strip()
     if not model_name:
@@ -582,14 +676,19 @@ def build_milvus_client(
     return MilvusClient(**client_kwargs), uri, False, db_name
 
 
-def describe_collection_dim(client: MilvusClient, collection_name: str) -> int | None:
+def describe_collection_dim(
+    client: MilvusClient,
+    collection_name: str,
+    *,
+    field_name: str = VECTOR_FIELD_NAME,
+) -> int | None:
     description = client.describe_collection(collection_name=collection_name)
     fields = description.get("fields", []) if isinstance(description, dict) else []
     for field in fields:
         if not isinstance(field, dict):
             continue
         name = field.get("name") or field.get("field_name")
-        if name != VECTOR_FIELD_NAME:
+        if name != field_name:
             continue
         params = field.get("params") or {}
         dim = params.get("dim")
@@ -653,6 +752,11 @@ def build_chunk_record(raw_row: dict[str, Any]) -> ChunkRecord:
         fallback=raw_row.get("section_title") or raw_row.get("document_title"),
     )
     heading_path = tuple(part.strip() for part in heading_path_text.split(" / ") if part.strip())
+    media_assets = tuple(
+        dict(asset)
+        for asset in metadata.get("media_assets") or []
+        if isinstance(asset, dict)
+    )
 
     return ChunkRecord(
         chunk_id=str(raw_row[PRIMARY_KEY_FIELD]),
@@ -668,6 +772,8 @@ def build_chunk_record(raw_row: dict[str, Any]) -> ChunkRecord:
         next_chunk_id=empty_to_none(raw_row.get("next_chunk_id")),
         display_text=str(raw_row.get("display_text") or ""),
         embedding_text=str(raw_row.get("embedding_text") or ""),
+        has_image=bool(raw_row.get("has_image") or metadata.get("has_image") or media_assets),
+        media_assets=media_assets,
         metadata=metadata,
         heading_path=heading_path,
         heading_path_text=heading_path_text,
@@ -805,11 +911,18 @@ class OnlineRAGService:
             cfg, env_values
         )
         self.vector_dim = describe_collection_dim(self.client, self.collection_name)
+        self.image_vector_dim = describe_collection_dim(
+            self.client,
+            self.collection_name,
+            field_name=IMAGE_VECTOR_FIELD_NAME,
+        )
         self.recall_model = env_values["OPENAI_RECALL_MODEL"]
+        self.image_embedding_model = env_values["IMAGE_EMBEDDING_MODEL"]
         self.rerank_model = resolve_rerank_model(env_values)
         self.rerank_endpoint = resolve_rerank_endpoint(env_values["OPENAI_BASE_URL"])
         self.rerank_api_key = env_values["OPENAI_API_KEY"]
         self.recall_embeddings = build_embeddings(env_values, model_env_name="OPENAI_RECALL_MODEL")
+        self.image_embeddings = build_image_embedding_client(env_values)
         self._state_lock = threading.RLock()
         self._milvus_lock = threading.RLock()
         self._elasticsearch_lock = threading.RLock()
@@ -830,6 +943,8 @@ class OnlineRAGService:
                 "collection_name": self.collection_name,
                 "vector_field": VECTOR_FIELD_NAME,
                 "vector_dim": self.vector_dim,
+                "image_vector_field": IMAGE_VECTOR_FIELD_NAME,
+                "image_vector_dim": self.image_vector_dim,
             },
             "elasticsearch": {
                 "url": sanitize_elasticsearch_url(self.elasticsearch_url),
@@ -839,16 +954,19 @@ class OnlineRAGService:
             },
             "models": {
                 "recall": self.recall_model,
+                "image_embedding": self.image_embedding_model,
                 "rerank": self.rerank_model,
             },
             "defaults": {
                 "dense_top_k": self.cfg.dense_top_k,
+                "image_top_k": self.cfg.image_top_k,
                 "lexical_top_k": self.cfg.lexical_top_k,
                 "heading_top_k": self.cfg.heading_top_k,
                 "candidate_pool_size": self.cfg.candidate_pool_size,
                 "final_top_k": self.cfg.final_top_k,
                 "rrf_k": self.cfg.rrf_k,
                 "dense_weight": self.cfg.dense_weight,
+                "image_weight": self.cfg.image_weight,
                 "body_weight": self.cfg.body_weight,
                 "heading_weight": self.cfg.heading_weight,
                 "rerank_fusion_boost": self.cfg.rerank_fusion_boost,
@@ -989,14 +1107,25 @@ class OnlineRAGService:
         vector = self.recall_embeddings.embed_query(query)
         return ensure_cosine_vector(vector, expected_dim=self.vector_dim)
 
-    def _dense_search(self, query_vector: np.ndarray, *, milvus_filter: str, top_k: int) -> list[LaneHit]:
+    def _embed_image_query(self, query: str) -> np.ndarray:
+        vector = self.image_embeddings.embed_query(query)
+        return ensure_cosine_vector(vector, expected_dim=self.image_vector_dim)
+
+    def _vector_search(
+        self,
+        query_vector: np.ndarray,
+        *,
+        vector_field: str,
+        milvus_filter: str,
+        top_k: int,
+    ) -> list[LaneHit]:
         if top_k <= 0:
             return []
 
         with self._milvus_lock:
             results = self.client.search(
                 collection_name=self.collection_name,
-                anns_field=VECTOR_FIELD_NAME,
+                anns_field=vector_field,
                 data=[query_vector.tolist()],
                 filter=milvus_filter,
                 limit=top_k,
@@ -1035,6 +1164,23 @@ class OnlineRAGService:
                 )
             )
         return dense_hits
+
+    def _dense_search(self, query_vector: np.ndarray, *, milvus_filter: str, top_k: int) -> list[LaneHit]:
+        return self._vector_search(
+            query_vector,
+            vector_field=VECTOR_FIELD_NAME,
+            milvus_filter=milvus_filter,
+            top_k=top_k,
+        )
+
+    def _image_search(self, query_vector: np.ndarray, *, milvus_filter: str, top_k: int) -> list[LaneHit]:
+        image_filter = f"{milvus_filter} and has_image == true"
+        return self._vector_search(
+            query_vector,
+            vector_field=IMAGE_VECTOR_FIELD_NAME,
+            milvus_filter=image_filter,
+            top_k=top_k,
+        )
 
     def _lexical_search(
         self,
@@ -1151,6 +1297,7 @@ class OnlineRAGService:
         index = self._require_index()
         top_k = request.top_k or self.cfg.final_top_k
         dense_top_k = request.dense_top_k or self.cfg.dense_top_k
+        image_top_k = request.image_top_k or self.cfg.image_top_k
         lexical_top_k = request.lexical_top_k or self.cfg.lexical_top_k
         heading_top_k = request.heading_top_k or self.cfg.heading_top_k
         candidate_pool_size = request.candidate_pool_size or self.cfg.candidate_pool_size
@@ -1167,6 +1314,15 @@ class OnlineRAGService:
             top_k=dense_top_k,
         )
         dense_took_ms = round((time.perf_counter() - dense_started_at) * 1000, 2)
+
+        image_query_vector = self._embed_image_query(query)
+        image_started_at = time.perf_counter()
+        image_hits = self._image_search(
+            image_query_vector,
+            milvus_filter=milvus_filter,
+            top_k=image_top_k,
+        )
+        image_took_ms = round((time.perf_counter() - image_started_at) * 1000, 2)
 
         body_started_at = time.perf_counter()
         body_hits = self._lexical_search(
@@ -1187,11 +1343,14 @@ class OnlineRAGService:
 
         if self.cfg.debug:
             logger.info(
-                "retrieval lanes dense_ms=%s body_ms=%s heading_ms=%s dense_hits=%s body_hits=%s heading_hits=%s",
+                "retrieval lanes dense_ms=%s image_ms=%s body_ms=%s heading_ms=%s "
+                "dense_hits=%s image_hits=%s body_hits=%s heading_hits=%s",
                 dense_took_ms,
+                image_took_ms,
                 body_took_ms,
                 heading_took_ms,
                 len(dense_hits),
+                len(image_hits),
                 len(body_hits),
                 len(heading_hits),
             )
@@ -1202,6 +1361,12 @@ class OnlineRAGService:
             lane_hits=dense_hits,
             lane_name="dense",
             lane_weight=self.cfg.dense_weight,
+        )
+        self._apply_rrf_lane(
+            fused_candidates,
+            lane_hits=image_hits,
+            lane_name="image",
+            lane_weight=self.cfg.image_weight,
         )
         self._apply_rrf_lane(
             fused_candidates,
@@ -1218,7 +1383,12 @@ class OnlineRAGService:
 
         ranked_candidates = sorted(
             fused_candidates.values(),
-            key=lambda item: (item.fused_rrf, -(item.dense_rank or 10**9), -(item.body_rank or 10**9)),
+            key=lambda item: (
+                item.fused_rrf,
+                -(item.dense_rank or 10**9),
+                -(item.image_rank or 10**9),
+                -(item.body_rank or 10**9),
+            ),
             reverse=True,
         )
         ranked_candidates = ranked_candidates[:candidate_pool_size]
@@ -1231,6 +1401,7 @@ class OnlineRAGService:
                 "applied_filters": request.filters.model_dump(mode="json") if request.filters else None,
                 "counts": {
                     "dense_hits": len(dense_hits),
+                    "image_hits": len(image_hits),
                     "body_hits": len(body_hits),
                     "heading_hits": len(heading_hits),
                     "candidate_pool": 0,
@@ -1274,13 +1445,17 @@ class OnlineRAGService:
                         "rerank_relevance_score": float(relevance_score),
                         "fused_rrf": float(candidate.fused_rrf),
                         "dense_rrf": float(candidate.dense_rrf),
+                        "image_rrf": float(candidate.image_rrf),
                         "body_rrf": float(candidate.body_rrf),
                         "heading_rrf": float(candidate.heading_rrf),
                         "dense_rank": candidate.dense_rank,
+                        "image_rank": candidate.image_rank,
                         "body_rank": candidate.body_rank,
                         "heading_rank": candidate.heading_rank,
                         "dense_raw_score": candidate.dense_raw_score,
                         "dense_distance": candidate.dense_distance,
+                        "image_raw_score": candidate.image_raw_score,
+                        "image_distance": candidate.image_distance,
                         "body_bm25": candidate.body_bm25,
                         "heading_bm25": candidate.heading_bm25,
                     },
@@ -1314,6 +1489,8 @@ class OnlineRAGService:
                 "page_end": row.page_end,
                 "display_text": row.display_text,
                 "retrieval_text": row.embedding_text,
+                "has_image": row.has_image,
+                "media_assets": list(row.media_assets),
                 "prev_chunk_id": row.prev_chunk_id,
                 "next_chunk_id": row.next_chunk_id,
                 "metadata": row.metadata,
@@ -1324,6 +1501,9 @@ class OnlineRAGService:
                     "heading_path": list(row.heading_path),
                     "source_block_ids": row.metadata.get("source_block_ids") or [],
                     "source_marker_block_ids": row.metadata.get("source_marker_block_ids") or [],
+                    "media_assets": list(row.media_assets),
+                    "has_image": row.has_image,
+                    "image_embedding_model": row.metadata.get("image_embedding_model"),
                 },
                 "scores": scores,
             }
@@ -1342,6 +1522,7 @@ class OnlineRAGService:
             "applied_filters": request.filters.model_dump(mode="json") if request.filters else None,
             "counts": {
                 "dense_hits": len(dense_hits),
+                "image_hits": len(image_hits),
                 "body_hits": len(body_hits),
                 "heading_hits": len(heading_hits),
                 "candidate_pool": len(ranked_candidates),
@@ -1367,6 +1548,11 @@ class OnlineRAGService:
                 candidate.dense_rank = lane_hit.rank
                 candidate.dense_raw_score = lane_hit.raw_score
                 candidate.dense_distance = lane_hit.distance
+            elif lane_name == "image":
+                candidate.image_rrf += contribution
+                candidate.image_rank = lane_hit.rank
+                candidate.image_raw_score = lane_hit.raw_score
+                candidate.image_distance = lane_hit.distance
             elif lane_name == "body":
                 candidate.body_rrf += contribution
                 candidate.body_rank = lane_hit.rank
@@ -1423,6 +1609,8 @@ class OnlineRAGService:
             "page_start": row.page_start,
             "page_end": row.page_end,
             "display_text": row.display_text,
+            "has_image": row.has_image,
+            "media_assets": list(row.media_assets),
         }
 
 

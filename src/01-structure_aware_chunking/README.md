@@ -143,6 +143,9 @@ docker run --rm `
 ## Notes
 
 - The script renders markdown by default. Pass `--emit-json` if you also want Marker JSON artifacts and JSON-based normalization.
+- Pass `--export-image-assets` to crop Marker `Figure`/`Picture` blocks from the source PDF into
+  `data/processed/01_structure_aware/image_assets/<doc_id>/` and attach `media_assets` metadata
+  to visual blocks. This option also enables Marker JSON output.
 - The script now defaults to Marker `--use_llm` with `marker.services.openai.OpenAIService`.
 - `phase01` accepts `--torch-device` and forwards it to Marker as `TORCH_DEVICE`. Useful values are `cuda`, `cuda:0`, and `cpu`.
 - `.env` values like `OPENAI_API_KEY`, `OPENAI_MODEL`, and optional `OPENAI_BASE_URL` are forwarded to the Marker CLI automatically.

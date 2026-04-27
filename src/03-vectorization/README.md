@@ -109,6 +109,14 @@ container environment:
 - `OPENAI_BASE_URL`
 - `OPENAI_API_KEY`
 - `OPENAI_EMBEDDING_MODEL`
+- `IMAGE_EMBEDDING_MODEL`
+
+Optional image embedding overrides:
+
+- `IMAGE_EMBEDDING_BASE_URL` (defaults to `OPENAI_BASE_URL`)
+- `IMAGE_EMBEDDING_API_KEY` (defaults to `OPENAI_API_KEY`)
+- `IMAGE_EMBEDDING_DIM` (otherwise inferred from the first image vector)
+- `IMAGE_EMBEDDING_INPUT_FORMAT` (defaults to `image_object`)
 
 Milvus settings are optional. Without `MILVUS_URI`, the pipeline uses
 `http://localhost:19530`. Inside Docker Compose, `phase03` defaults to
@@ -132,6 +140,9 @@ Optional Elasticsearch settings:
 - Phase 03 does not reinterpret phase-02 chunk boundaries.
 - Phase 03 does not introduce extra filtering beyond the inherited
   `indexable` flag.
+- Phase 03 stores both text vectors (`embedding`) and image vectors
+  (`image_embedding`) in the same Milvus collection. Text-only chunks receive
+  a zero image vector and `has_image=false`.
 - Re-running phase 03 for the same `doc_id` replaces that document's rows in
   both Milvus and Elasticsearch before inserting the new version.
 - If the target collection still has the old `FLAT` vector index, phase 03 now

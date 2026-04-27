@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import datetime as dt
 import json
+import mimetypes
 import os
 import re
 import sys
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Iterable
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 from urllib.parse import urlsplit, urlunsplit
 
 from elasticsearch import Elasticsearch, helpers as elasticsearch_helpers
@@ -27,13 +31,15 @@ DEFAULT_LEXICAL_ANALYZER = "english"
 DEFAULT_EMBEDDING_BATCH_SIZE = 32
 PAGE_NULL_SENTINEL = -1
 VECTOR_FIELD_NAME = "embedding"
+IMAGE_VECTOR_FIELD_NAME = "image_embedding"
 PRIMARY_KEY_FIELD = "chunk_id"
 METADATA_FIELD = "metadata"
 MAX_ID_LENGTH = 512
 MAX_TITLE_LENGTH = 4096
 MAX_TEXT_LENGTH = 65535
-PHASE03_SCHEMA_VERSION = "1.0"
+PHASE03_SCHEMA_VERSION = "1.1"
 VECTOR_INDEX_NAME = "embedding_hnsw"
+IMAGE_VECTOR_INDEX_NAME = "image_embedding_hnsw"
 VECTOR_INDEX_TYPE = "HNSW"
 VECTOR_METRIC_TYPE = "COSINE"
 VECTOR_INDEX_BUILD_PARAMS = {"M": 16, "efConstruction": 200}
@@ -46,6 +52,7 @@ SCALAR_INDEX_FIELDS = (
     "page_start",
     "page_end",
     "indexable",
+    "has_image",
 )
 
 
@@ -72,6 +79,8 @@ class PipelineConfig:
 class PreparedChunk:
     chunk_id: str
     embedding_input_text: str
+    media_assets: list[dict[str, Any]]
+    has_image: bool
     insert_row: dict[str, Any]
     enriched_row: dict[str, Any]
 
@@ -239,6 +248,82 @@ def merged_env(extra_env: dict[str, str]) -> dict[str, str]:
     return merged
 
 
+class ImageEmbeddingClient:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        image_input_format: str = "image_object",
+    ) -> None:
+        self.endpoint = base_url.rstrip("/") + "/embeddings"
+        self.api_key = api_key
+        self.model = model
+        self.image_input_format = image_input_format
+
+    def embed_query(self, text: str) -> list[float]:
+        vectors = self._request_embeddings([text])
+        return vectors[0]
+
+    def embed_images(self, paths: list[Path]) -> list[list[float]]:
+        if not paths:
+            return []
+        inputs = [self._image_input(path) for path in paths]
+        return self._request_embeddings(inputs)
+
+    def _image_input(self, path: Path) -> Any:
+        data_url = image_file_to_data_url(path)
+        if self.image_input_format == "image_url_object":
+            return {"image_url": data_url}
+        if self.image_input_format == "openai_content":
+            return {"type": "input_image", "image_url": data_url}
+        return {"image": data_url}
+
+    def _request_embeddings(self, inputs: list[Any]) -> list[list[float]]:
+        payload = {
+            "model": self.model,
+            "input": inputs,
+        }
+        raw_payload = json.dumps(payload).encode("utf-8")
+        request = urllib_request.Request(
+            self.endpoint,
+            data=raw_payload,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+
+        try:
+            with urllib_request.urlopen(request, timeout=120) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+        except urllib_error.HTTPError as exc:
+            error_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"Image embedding request failed with HTTP {exc.code}: {error_body}"
+            ) from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(f"Image embedding request failed: {exc.reason}") from exc
+
+        data = response_payload.get("data")
+        if not isinstance(data, list):
+            raise RuntimeError(f"Unexpected image embedding response payload: {response_payload!r}")
+
+        vectors: list[list[float]] = []
+        for item in data:
+            if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
+                raise RuntimeError(f"Unexpected image embedding item: {item!r}")
+            vectors.append([float(value) for value in item["embedding"]])
+
+        if len(vectors) != len(inputs):
+            raise RuntimeError(
+                f"Image embedding endpoint returned {len(vectors)} vectors for {len(inputs)} inputs."
+            )
+        return vectors
+
+
 def env_flag(value: str | None, *, default: bool) -> bool:
     if value is None:
         return default
@@ -271,6 +356,12 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def image_file_to_data_url(path: Path) -> str:
+    mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
 
 
 def infer_data_root(phase02_root: Path) -> Path:
@@ -348,6 +439,40 @@ def build_embeddings(env_values: dict[str, str], batch_size: int) -> OpenAIEmbed
     )
 
 
+def resolve_image_embedding_base_url(env_values: dict[str, str]) -> str:
+    return env_values.get("IMAGE_EMBEDDING_BASE_URL") or env_values["OPENAI_BASE_URL"]
+
+
+def resolve_image_embedding_api_key(env_values: dict[str, str]) -> str:
+    return env_values.get("IMAGE_EMBEDDING_API_KEY") or env_values["OPENAI_API_KEY"]
+
+
+def resolve_image_embedding_dim(env_values: dict[str, str]) -> int | None:
+    raw_value = (env_values.get("IMAGE_EMBEDDING_DIM") or "").strip()
+    if not raw_value:
+        return None
+    value = int(raw_value)
+    if value <= 0:
+        raise ValueError("IMAGE_EMBEDDING_DIM must be greater than 0.")
+    return value
+
+
+def build_image_embedding_client(env_values: dict[str, str]) -> ImageEmbeddingClient:
+    required = ("OPENAI_BASE_URL", "OPENAI_API_KEY", "IMAGE_EMBEDDING_MODEL")
+    missing = [key for key in required if not env_values.get(key)]
+    if missing:
+        raise KeyError(
+            "Phase-03 image vectorization requires these env vars: " + ", ".join(sorted(missing))
+        )
+
+    return ImageEmbeddingClient(
+        base_url=resolve_image_embedding_base_url(env_values),
+        api_key=resolve_image_embedding_api_key(env_values),
+        model=env_values["IMAGE_EMBEDDING_MODEL"],
+        image_input_format=env_values.get("IMAGE_EMBEDDING_INPUT_FORMAT", "image_object"),
+    )
+
+
 def looks_like_remote_milvus_uri(uri: str) -> bool:
     if "://" in uri:
         return True
@@ -394,7 +519,8 @@ def resolve_collection_name(cfg: PipelineConfig, env_values: dict[str, str]) -> 
         return explicit_name
     prefix = env_values.get("MILVUS_COLLECTION_PREFIX") or cfg.collection_prefix
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
-    return f"{slugify(prefix)}_{slugify(embedding_model)}"
+    image_embedding_model = env_values["IMAGE_EMBEDDING_MODEL"]
+    return f"{slugify(prefix)}_{slugify(embedding_model)}_{slugify(image_embedding_model)}"
 
 
 def resolve_elasticsearch_url(cfg: PipelineConfig, env_values: dict[str, str]) -> str:
@@ -484,8 +610,10 @@ def build_elasticsearch_index_config() -> dict[str, Any]:
                 "display_text": {"type": "text", "index": False},
                 "embedding_text": {"type": "text", "analyzer": DEFAULT_LEXICAL_ANALYZER},
                 "indexable": {"type": "boolean"},
+                "has_image": {"type": "boolean"},
                 "source_block_ids": {"type": "keyword"},
                 "source_marker_block_ids": {"type": "keyword"},
+                "media_asset_paths": {"type": "keyword"},
             }
         },
     }
@@ -531,8 +659,14 @@ def build_elasticsearch_document(prepared_chunk: PreparedChunk) -> dict[str, Any
         "display_text": str(row.get("display_text") or ""),
         "embedding_text": str(row.get("embedding_text") or ""),
         "indexable": bool(row.get("indexable")),
+        "has_image": bool(row.get("has_image")),
         "source_block_ids": list(metadata.get("source_block_ids") or []),
         "source_marker_block_ids": list(metadata.get("source_marker_block_ids") or []),
+        "media_asset_paths": [
+            str(asset.get("path"))
+            for asset in metadata.get("media_assets") or []
+            if isinstance(asset, dict) and asset.get("path")
+        ],
     }
 
 
@@ -627,14 +761,19 @@ def build_milvus_client(
     return client, uri, False, db_name
 
 
-def describe_collection_dim(client: MilvusClient, collection_name: str) -> int | None:
+def describe_collection_dim(
+    client: MilvusClient,
+    collection_name: str,
+    *,
+    field_name: str = VECTOR_FIELD_NAME,
+) -> int | None:
     description = client.describe_collection(collection_name=collection_name)
     fields = description.get("fields", []) if isinstance(description, dict) else []
     for field in fields:
         if not isinstance(field, dict):
             continue
         name = field.get("name") or field.get("field_name")
-        if name != VECTOR_FIELD_NAME:
+        if name != field_name:
             continue
         params = field.get("params") or {}
         dim = params.get("dim")
@@ -647,11 +786,40 @@ def describe_collection_dim(client: MilvusClient, collection_name: str) -> int |
     return None
 
 
+def collection_field_names(client: MilvusClient, collection_name: str) -> set[str]:
+    description = client.describe_collection(collection_name=collection_name)
+    fields = description.get("fields", []) if isinstance(description, dict) else []
+    return {
+        str(field.get("name") or field.get("field_name"))
+        for field in fields
+        if isinstance(field, dict) and (field.get("name") or field.get("field_name"))
+    }
+
+
+def build_single_vector_index_params(field_name: str, index_name: str):
+    vector_index_params = MilvusClient.prepare_index_params()
+    vector_index_params.add_index(
+        field_name=field_name,
+        index_name=index_name,
+        index_type=VECTOR_INDEX_TYPE,
+        metric_type=VECTOR_METRIC_TYPE,
+        params=dict(VECTOR_INDEX_BUILD_PARAMS),
+    )
+    return vector_index_params
+
+
 def build_vector_index_params():
     vector_index_params = MilvusClient.prepare_index_params()
     vector_index_params.add_index(
         field_name=VECTOR_FIELD_NAME,
         index_name=VECTOR_INDEX_NAME,
+        index_type=VECTOR_INDEX_TYPE,
+        metric_type=VECTOR_METRIC_TYPE,
+        params=dict(VECTOR_INDEX_BUILD_PARAMS),
+    )
+    vector_index_params.add_index(
+        field_name=IMAGE_VECTOR_FIELD_NAME,
+        index_name=IMAGE_VECTOR_INDEX_NAME,
         index_type=VECTOR_INDEX_TYPE,
         metric_type=VECTOR_METRIC_TYPE,
         params=dict(VECTOR_INDEX_BUILD_PARAMS),
@@ -683,14 +851,20 @@ def describe_vector_indexes(client: MilvusClient, collection_name: str) -> list[
 
         for item in raw_descriptions:
             field_name = item.get("field_name") or item.get("fieldName") or item.get("field")
-            if field_name == VECTOR_FIELD_NAME:
+            if field_name in {VECTOR_FIELD_NAME, IMAGE_VECTOR_FIELD_NAME}:
                 descriptions.append(item)
     return descriptions
 
 
 def is_expected_vector_index(description: dict[str, Any]) -> bool:
+    field_name = str(
+        description.get("field_name") or description.get("fieldName") or description.get("field") or ""
+    )
+    expected_index_name = (
+        IMAGE_VECTOR_INDEX_NAME if field_name == IMAGE_VECTOR_FIELD_NAME else VECTOR_INDEX_NAME
+    )
     return (
-        str(description.get("index_name") or "").strip() == VECTOR_INDEX_NAME
+        str(description.get("index_name") or "").strip() == expected_index_name
         and str(description.get("index_type") or "").upper() == VECTOR_INDEX_TYPE
         and str(description.get("metric_type") or "").upper() == VECTOR_METRIC_TYPE
     )
@@ -703,7 +877,15 @@ def ensure_vector_index(
     debug: bool,
 ) -> bool:
     descriptions = describe_vector_indexes(client, collection_name)
-    has_expected_index = any(is_expected_vector_index(description) for description in descriptions)
+    expected_indexes = {
+        VECTOR_FIELD_NAME: VECTOR_INDEX_NAME,
+        IMAGE_VECTOR_FIELD_NAME: IMAGE_VECTOR_INDEX_NAME,
+    }
+    expected_fields = {
+        str(description.get("field_name") or description.get("fieldName") or description.get("field") or "")
+        for description in descriptions
+        if is_expected_vector_index(description)
+    }
     stale_index_names = sorted(
         {
             str(description.get("index_name")).strip()
@@ -712,7 +894,8 @@ def ensure_vector_index(
         }
     )
 
-    if not stale_index_names and has_expected_index:
+    missing_fields = sorted(set(expected_indexes) - expected_fields)
+    if not stale_index_names and not missing_fields:
         return False
 
     with suppress(Exception):
@@ -727,11 +910,15 @@ def ensure_vector_index(
                 flush=True,
             )
 
-    if not has_expected_index:
-        client.create_index(collection_name=collection_name, index_params=build_vector_index_params())
+    for field_name in missing_fields:
+        client.create_index(
+            collection_name=collection_name,
+            index_params=build_single_vector_index_params(field_name, expected_indexes[field_name]),
+        )
         if debug:
             print(
-                f"[phase03] Ensured {VECTOR_INDEX_TYPE} vector index {VECTOR_INDEX_NAME} on {collection_name}.",
+                f"[phase03] Ensured {VECTOR_INDEX_TYPE} vector index {expected_indexes[field_name]} "
+                f"on {collection_name}.",
                 file=sys.stderr,
                 flush=True,
             )
@@ -739,7 +926,7 @@ def ensure_vector_index(
     return True
 
 
-def build_collection_schema(vector_dim: int):
+def build_collection_schema(vector_dim: int, image_vector_dim: int):
     schema = MilvusClient.create_schema(auto_id=False, enable_dynamic_field=False)
     schema.add_field(field_name=PRIMARY_KEY_FIELD, datatype=DataType.VARCHAR, is_primary=True, max_length=MAX_ID_LENGTH)
     schema.add_field(field_name="doc_id", datatype=DataType.VARCHAR, max_length=MAX_ID_LENGTH)
@@ -755,6 +942,7 @@ def build_collection_schema(vector_dim: int):
     schema.add_field(field_name="page_start", datatype=DataType.INT64)
     schema.add_field(field_name="page_end", datatype=DataType.INT64)
     schema.add_field(field_name="indexable", datatype=DataType.BOOL)
+    schema.add_field(field_name="has_image", datatype=DataType.BOOL)
     schema.add_field(field_name="estimated_token_count", datatype=DataType.INT64)
     schema.add_field(field_name="sibling_index", datatype=DataType.INT64)
     schema.add_field(field_name="sibling_count", datatype=DataType.INT64)
@@ -764,6 +952,7 @@ def build_collection_schema(vector_dim: int):
     schema.add_field(field_name="embedding_text", datatype=DataType.VARCHAR, max_length=MAX_TEXT_LENGTH)
     schema.add_field(field_name=METADATA_FIELD, datatype=DataType.JSON)
     schema.add_field(field_name=VECTOR_FIELD_NAME, datatype=DataType.FLOAT_VECTOR, dim=vector_dim)
+    schema.add_field(field_name=IMAGE_VECTOR_FIELD_NAME, datatype=DataType.FLOAT_VECTOR, dim=image_vector_dim)
 
     return schema, build_vector_index_params(), build_scalar_index_params()
 
@@ -773,15 +962,35 @@ def ensure_collection(
     *,
     collection_name: str,
     vector_dim: int,
+    image_vector_dim: int,
     debug: bool,
 ) -> bool:
     created = False
     if client.has_collection(collection_name=collection_name):
+        field_names = collection_field_names(client, collection_name)
+        required_fields = {VECTOR_FIELD_NAME, IMAGE_VECTOR_FIELD_NAME, "has_image"}
+        missing_fields = sorted(required_fields - field_names)
+        if missing_fields:
+            raise RuntimeError(
+                f"Milvus collection {collection_name} is missing fields required by multimodal "
+                f"phase03 schema: {', '.join(missing_fields)}. Use a new collection name or rerun "
+                "with the default multimodal collection naming."
+            )
         existing_dim = describe_collection_dim(client, collection_name)
         if existing_dim is not None and existing_dim != vector_dim:
             raise RuntimeError(
                 f"Milvus collection {collection_name} already exists with vector dimension "
                 f"{existing_dim}, but phase03 produced dimension {vector_dim}."
+            )
+        existing_image_dim = describe_collection_dim(
+            client,
+            collection_name,
+            field_name=IMAGE_VECTOR_FIELD_NAME,
+        )
+        if existing_image_dim is not None and existing_image_dim != image_vector_dim:
+            raise RuntimeError(
+                f"Milvus collection {collection_name} already exists with image vector dimension "
+                f"{existing_image_dim}, but phase03 produced dimension {image_vector_dim}."
             )
         ensure_vector_index(
             client,
@@ -789,7 +998,7 @@ def ensure_collection(
             debug=debug,
         )
     else:
-        schema, vector_index_params, scalar_index_params = build_collection_schema(vector_dim)
+        schema, vector_index_params, scalar_index_params = build_collection_schema(vector_dim, image_vector_dim)
         client.create_collection(
             collection_name=collection_name,
             schema=schema,
@@ -841,6 +1050,31 @@ def safe_metadata(value: dict[str, Any], *, chunk_id: str) -> dict[str, Any]:
     return value
 
 
+def resolve_media_asset_path(raw_path: str, phase02_root: Path) -> Path:
+    candidate = Path(raw_path)
+    if candidate.exists():
+        return candidate
+
+    data_root = infer_data_root(phase02_root)
+    attempts: list[Path] = []
+    if raw_path.startswith("/app/data/"):
+        suffix = raw_path.removeprefix("/app/data/")
+        attempts.append(REPO_ROOT / "data" / suffix)
+        attempts.append(data_root / suffix)
+    elif raw_path.startswith("/app/"):
+        suffix = raw_path.removeprefix("/app/")
+        attempts.append(REPO_ROOT / suffix)
+        attempts.append(data_root.parent / suffix)
+    elif raw_path.startswith("data/"):
+        attempts.append(REPO_ROOT / raw_path)
+        attempts.append(data_root.parent / raw_path)
+
+    for attempt in attempts:
+        if attempt.exists():
+            return attempt
+    raise FileNotFoundError(f"Could not resolve image asset path: {raw_path}")
+
+
 def build_chunk_metadata(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "heading_path": list(row.get("heading_path") or []),
@@ -854,6 +1088,8 @@ def build_chunk_metadata(row: dict[str, Any]) -> dict[str, Any]:
         "char_end_in_parent": row.get("char_end_in_parent"),
         "parent_char_count": row.get("parent_char_count"),
         "char_count": row.get("char_count"),
+        "media_assets": list(row.get("media_assets") or []),
+        "has_image": bool(row.get("has_image")),
         "raw_page_start": row.get("page_start"),
         "raw_page_end": row.get("page_end"),
     }
@@ -864,13 +1100,20 @@ def prepare_chunks(
     *,
     collection_name: str,
     embedding_model: str,
+    image_embedding_model: str,
 ) -> tuple[list[dict[str, Any]], list[PreparedChunk]]:
     enriched_rows: list[dict[str, Any]] = []
     prepared_chunks: list[PreparedChunk] = []
 
     for row in semantic_chunks:
         chunk_id = str(row["chunk_id"])
-        metadata = safe_metadata(build_chunk_metadata(row), chunk_id=chunk_id)
+        media_assets = [asset for asset in row.get("media_assets") or [] if isinstance(asset, dict)]
+        has_image = bool(row.get("has_image") and media_assets)
+        metadata_payload = build_chunk_metadata(row)
+        metadata_payload["media_assets"] = media_assets
+        metadata_payload["has_image"] = has_image
+        metadata_payload["image_embedding_model"] = image_embedding_model if has_image else None
+        metadata = safe_metadata(metadata_payload, chunk_id=chunk_id)
         storage_page_start = safe_int(row.get("page_start"))
         storage_page_end = safe_int(row.get("page_end"))
 
@@ -889,6 +1132,7 @@ def prepare_chunks(
             "page_start": storage_page_start,
             "page_end": storage_page_end,
             "indexable": bool(row.get("indexable")),
+            "has_image": has_image,
             "estimated_token_count": int(row.get("estimated_token_count") or 0),
             "sibling_index": int(row.get("sibling_index") or 0),
             "sibling_count": int(row.get("sibling_count") or 0),
@@ -905,6 +1149,7 @@ def prepare_chunks(
             "collection_name": collection_name,
             "primary_key": chunk_id,
             "embedding_model": embedding_model,
+            "image_embedding_model": image_embedding_model,
             "storage_page_start": storage_page_start,
             "storage_page_end": storage_page_end,
             "metadata": metadata,
@@ -916,6 +1161,8 @@ def prepare_chunks(
                 PreparedChunk(
                     chunk_id=chunk_id,
                     embedding_input_text=str(row["embedding_text"]),
+                    media_assets=media_assets,
+                    has_image=has_image,
                     insert_row=insert_row,
                     enriched_row=enriched_row,
                 )
@@ -960,6 +1207,99 @@ def embed_prepared_chunks(
             )
 
     return vector_dim
+
+
+def mean_vectors(vectors: list[list[float]]) -> list[float]:
+    if not vectors:
+        return []
+    dim = len(vectors[0])
+    totals = [0.0] * dim
+    for vector in vectors:
+        if len(vector) != dim:
+            raise RuntimeError(f"Image vector dimension mismatch while averaging: {len(vector)} != {dim}.")
+        for index, value in enumerate(vector):
+            totals[index] += float(value)
+    return [value / len(vectors) for value in totals]
+
+
+def first_asset_path(asset: dict[str, Any]) -> str | None:
+    path = asset.get("path")
+    if path:
+        return str(path)
+    return None
+
+
+def embed_image_prepared_chunks(
+    prepared_chunks: list[PreparedChunk],
+    image_embeddings: ImageEmbeddingClient,
+    *,
+    phase02_root: Path,
+    expected_dim: int | None,
+    batch_size: int,
+    debug: bool,
+) -> int:
+    image_dim = expected_dim
+    chunks_with_images = [chunk for chunk in prepared_chunks if chunk.has_image]
+
+    if not chunks_with_images:
+        if image_dim is None:
+            image_dim = len(image_embeddings.embed_query("dimension probe"))
+        zero_vector = [0.0] * image_dim
+        for chunk in prepared_chunks:
+            chunk.insert_row[IMAGE_VECTOR_FIELD_NAME] = list(zero_vector)
+        return image_dim
+
+    pending: list[tuple[PreparedChunk, Path]] = []
+    chunk_paths: dict[str, list[Path]] = {}
+    for chunk in chunks_with_images:
+        for asset in chunk.media_assets:
+            raw_path = first_asset_path(asset)
+            if not raw_path:
+                continue
+            path = resolve_media_asset_path(raw_path, phase02_root)
+            chunk_paths.setdefault(chunk.chunk_id, []).append(path)
+            pending.append((chunk, path))
+
+    if not pending:
+        raise RuntimeError("Phase-03 found visual chunks marked has_image=true, but no image asset paths.")
+
+    vectors_by_chunk_id: dict[str, list[list[float]]] = {chunk.chunk_id: [] for chunk in chunks_with_images}
+    for batch_number, batch in enumerate(batched(pending, batch_size), start=1):
+        paths = [path for _chunk, path in batch]
+        vectors = image_embeddings.embed_images(paths)
+        for (chunk, _path), vector in zip(batch, vectors, strict=False):
+            if image_dim is None:
+                image_dim = len(vector)
+            elif len(vector) != image_dim:
+                raise RuntimeError(
+                    f"Image asset for chunk {chunk.chunk_id} produced vector dimension {len(vector)}; "
+                    f"expected {image_dim}."
+                )
+            vectors_by_chunk_id[chunk.chunk_id].append(vector)
+
+        if debug:
+            print(
+                f"[phase03] Embedded image batch {batch_number} with {len(batch)} image assets.",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if image_dim is None:
+        raise RuntimeError("Phase-03 did not produce any image embedding vectors.")
+
+    zero_vector = [0.0] * image_dim
+    for chunk in prepared_chunks:
+        if not chunk.has_image:
+            chunk.insert_row[IMAGE_VECTOR_FIELD_NAME] = list(zero_vector)
+            continue
+
+        chunk_vectors = vectors_by_chunk_id.get(chunk.chunk_id) or []
+        if not chunk_vectors:
+            raise RuntimeError(f"Chunk {chunk.chunk_id} is marked has_image=true but no image vector was produced.")
+        chunk.insert_row[IMAGE_VECTOR_FIELD_NAME] = mean_vectors(chunk_vectors)
+        chunk.enriched_row["phase03"]["image_asset_count"] = len(chunk_paths.get(chunk.chunk_id) or [])
+
+    return image_dim
 
 
 def delete_existing_doc_rows(
@@ -1012,8 +1352,11 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
 
     print(f"[phase03] Starting vectorization for {doc_id}", file=sys.stderr, flush=True)
     embeddings = build_embeddings(env_values, cfg.embedding_batch_size)
+    image_embeddings = build_image_embedding_client(env_values)
     collection_name = resolve_collection_name(cfg, env_values)
     embedding_model = env_values["OPENAI_EMBEDDING_MODEL"]
+    image_embedding_model = env_values["IMAGE_EMBEDDING_MODEL"]
+    configured_image_vector_dim = resolve_image_embedding_dim(env_values)
 
     output_root = ensure_dir(cfg.output_root)
     manifests_dir = ensure_dir(output_root / "manifests")
@@ -1032,6 +1375,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
         semantic_chunks,
         collection_name=collection_name,
         embedding_model=embedding_model,
+        image_embedding_model=image_embedding_model,
     )
 
     inserted_chunk_count = 0
@@ -1042,6 +1386,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
     created_collection = False
     created_elasticsearch_index = False
     vector_dim: int | None = None
+    image_vector_dim: int | None = configured_image_vector_dim
     milvus_client: MilvusClient | None = None
     milvus_uri: str | None = None
     local_milvus = False
@@ -1071,11 +1416,20 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             )
             if vector_dim is None:
                 raise RuntimeError("Phase-03 did not produce any embedding vectors.")
+            image_vector_dim = embed_image_prepared_chunks(
+                prepared_chunks,
+                image_embeddings,
+                phase02_root=cfg.phase02_root,
+                expected_dim=configured_image_vector_dim,
+                batch_size=cfg.embedding_batch_size,
+                debug=cfg.debug,
+            )
 
             created_collection = ensure_collection(
                 milvus_client,
                 collection_name=collection_name,
                 vector_dim=vector_dim,
+                image_vector_dim=image_vector_dim,
                 debug=cfg.debug,
             )
             created_elasticsearch_index = ensure_elasticsearch_index(
@@ -1141,6 +1495,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
         "phase03_policy": {
             "schema_version": PHASE03_SCHEMA_VERSION,
             "vector_input_from_phase02_embedding_text": True,
+            "image_vector_input_from_phase02_media_assets": True,
             "inherits_phase02_indexable_without_extra_filtering": True,
             "milvus_primary_key": PRIMARY_KEY_FIELD,
             "milvus_doc_filter_field": "doc_id",
@@ -1152,13 +1507,22 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "batch_size": cfg.embedding_batch_size,
             "dimension": vector_dim,
         },
+        "image_embedding": {
+            "base_url": resolve_image_embedding_base_url(env_values),
+            "model": image_embedding_model,
+            "batch_size": cfg.embedding_batch_size,
+            "dimension": image_vector_dim,
+            "input_format": env_values.get("IMAGE_EMBEDDING_INPUT_FORMAT", "image_object"),
+        },
         "milvus": {
             "uri": sanitize_milvus_uri(milvus_uri or resolve_milvus_uri(cfg, env_values)),
             "mode": "lite" if local_milvus else "server",
             "db_name": milvus_db_name,
             "collection_name": collection_name,
             "vector_field": VECTOR_FIELD_NAME,
+            "image_vector_field": IMAGE_VECTOR_FIELD_NAME,
             "vector_index_name": VECTOR_INDEX_NAME,
+            "image_vector_index_name": IMAGE_VECTOR_INDEX_NAME,
             "vector_metric_type": VECTOR_METRIC_TYPE,
             "vector_index_type_requested": VECTOR_INDEX_TYPE,
             "vector_index_build_params": dict(VECTOR_INDEX_BUILD_PARAMS),
@@ -1181,6 +1545,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
         "stats": {
             "semantic_chunk_count": len(semantic_chunks),
             "indexable_chunk_count": sum(1 for row in semantic_chunks if row["indexable"]),
+            "image_chunk_count": sum(1 for row in semantic_chunks if row.get("indexable") and row.get("has_image")),
             "inserted_chunk_count": inserted_chunk_count,
             "deleted_existing_chunk_count": deleted_chunk_count,
             "indexed_lexical_chunk_count": inserted_lexical_chunk_count,

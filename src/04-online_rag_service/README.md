@@ -79,7 +79,13 @@ Example request:
 - `OPENAI_API_KEY`
 - `OPENAI_RECALL_MODEL`
 - `OPENAI_EMBEDDING_MODEL`
+- `IMAGE_EMBEDDING_MODEL`
 - `OPENAI_RERANK_MODEL`
+
+Optional image embedding overrides:
+
+- `IMAGE_EMBEDDING_BASE_URL` (defaults to `OPENAI_BASE_URL`)
+- `IMAGE_EMBEDDING_API_KEY` (defaults to `OPENAI_API_KEY`)
 
 Milvus settings follow the same convention as phase 03:
 
@@ -138,6 +144,9 @@ docker compose up phase04
 - The service returns both `display_text` and `retrieval_text`
   (`embedding_text`) so the downstream assistant can choose between
   presentation text and retrieval-optimized text.
+- Text queries also search the `image_embedding` vector field for chunks with
+  `has_image=true`; visual results include `media_assets` so callers can render
+  the cropped source image.
 - `OPENAI_RERANK_MODEL` must be set explicitly in `.env` or the runtime environment.
 - Phase 04 assumes the phase-03 vectors live in Milvus standalone/server
   because phase 03 now builds an `HNSW` index. In Docker Compose, `phase04`

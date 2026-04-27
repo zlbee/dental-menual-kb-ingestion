@@ -65,6 +65,8 @@ class Phase2ParentUnit:
     source_structural_chunk_orders: list[int]
     source_block_ids: list[str]
     source_marker_block_ids: list[str]
+    media_assets: list[dict[str, Any]]
+    has_image: bool
 
 
 @dataclasses.dataclass(slots=True)
@@ -272,6 +274,18 @@ def unique_preserve_order(values: Iterable[Any]) -> list[Any]:
     return ordered
 
 
+def unique_media_assets(values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    ordered: list[dict[str, Any]] = []
+    for value in values:
+        key = str(value.get("asset_id") or value.get("path") or value.get("marker_block_id") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(dict(value))
+    return ordered
+
+
 def infer_data_root(phase01_root: Path) -> Path:
     if phase01_root.name == "01_structure_aware" and phase01_root.parent.name == "processed":
         return phase01_root.parent.parent
@@ -386,6 +400,12 @@ def combine_chunks(
     semantic_hint: str,
     joiner: str,
 ) -> Phase2ParentUnit:
+    media_assets = unique_media_assets(
+        asset
+        for piece in pieces
+        for asset in piece.get("media_assets") or []
+        if isinstance(asset, dict)
+    )
     return Phase2ParentUnit(
         unit_order=unit_order,
         unit_kind=unit_kind,
@@ -416,6 +436,8 @@ def combine_chunks(
             for block_id in piece.get("source_marker_block_ids") or []
             if block_id
         ),
+        media_assets=media_assets,
+        has_image=bool(media_assets),
     )
 
 
@@ -919,6 +941,8 @@ def create_semantic_chunks(
                 "source_structural_chunk_count": len(unit.source_structural_chunk_ids),
                 "source_block_ids": source_block_ids or unit.source_block_ids,
                 "source_marker_block_ids": source_marker_block_ids or unit.source_marker_block_ids,
+                "media_assets": unit.media_assets,
+                "has_image": bool(unit.has_image),
                 "char_start_in_parent": char_start,
                 "char_end_in_parent": char_end,
                 "parent_char_count": len(unit.display_text),
@@ -1017,6 +1041,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "inherits_heading_path_from_phase01": True,
             "reclassifies_front_matter_in_phase02": False,
             "indexes_visual_content": True,
+            "propagates_media_assets": True,
             "larger_more_complete_chunks": True,
         },
         "semantic_chunker": {
@@ -1043,6 +1068,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "structural_chunk_count": len(structural_chunks),
             "semantic_chunk_count": len(semantic_chunks),
             "indexable_chunk_count": sum(1 for row in semantic_chunks if row["indexable"]),
+            "image_chunk_count": sum(1 for row in semantic_chunks if row.get("has_image")),
             **phase02_stats,
         },
     }

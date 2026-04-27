@@ -82,6 +82,7 @@ class PipelineConfig:
     torch_device: str | None
     emit_json: bool
     disable_image_extraction: bool
+    export_image_assets: bool
     paginate_output: bool
     page_range: str | None
     segment_by_outline: bool
@@ -152,6 +153,15 @@ def parse_args() -> PipelineConfig:
         help="Also render Marker JSON in addition to markdown. Defaults to markdown only.",
     )
     parser.add_argument(
+        "--export-image-assets",
+        action="store_true",
+        help=(
+            "Crop Figure/Picture blocks from the source PDF into stable image assets "
+            "and attach their paths to normalized visual blocks. This also enables "
+            "Marker JSON output."
+        ),
+    )
+    parser.add_argument(
         "--disable-image-extraction",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -217,8 +227,9 @@ def parse_args() -> PipelineConfig:
         llm_service=parsed.llm_service,
         use_llm=parsed.use_llm,
         torch_device=(parsed.torch_device.strip() or None) if parsed.torch_device else None,
-        emit_json=parsed.emit_json,
+        emit_json=bool(parsed.emit_json or parsed.export_image_assets),
         disable_image_extraction=parsed.disable_image_extraction,
+        export_image_assets=parsed.export_image_assets,
         paginate_output=parsed.paginate_output,
         page_range=parsed.page_range,
         segment_by_outline=parsed.segment_by_outline,
@@ -1312,6 +1323,115 @@ def normalize_search_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def iter_visual_marker_blocks(payload: Any) -> Iterable[dict[str, Any]]:
+    pages, _metadata = extract_pages_and_metadata(payload)
+
+    for page in pages:
+        page_num = extract_page_number(page)
+
+        def walk(node: dict[str, Any]) -> Iterable[dict[str, Any]]:
+            block_type = str(node.get("block_type") or "")
+            if block_type in {"Figure", "Picture"}:
+                yield {
+                    "marker_block_id": str(node.get("id") or ""),
+                    "source_block_type": block_type,
+                    "page_num": page_num,
+                    "bbox": copy.deepcopy(node.get("bbox")),
+                    "polygon": copy.deepcopy(node.get("polygon")),
+                }
+
+            children = node.get("children") or []
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict):
+                        yield from walk(child)
+
+        yield from walk(page)
+
+
+def clean_bbox(value: Any) -> list[float] | None:
+    if not isinstance(value, list) or len(value) != 4:
+        return None
+    try:
+        bbox = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+        return None
+    return bbox
+
+
+def export_marker_image_assets(
+    *,
+    cfg: PipelineConfig,
+    marker_payload: Any,
+    assets_root: Path,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    try:
+        import fitz  # type: ignore[import-not-found]
+    except ImportError as exc:  # pragma: no cover - dependency is provided by phase01 requirements
+        raise RuntimeError("Phase-01 image asset export requires PyMuPDF.") from exc
+
+    ensure_dir(assets_root)
+    assets_by_marker_id: dict[str, list[dict[str, Any]]] = {}
+    exported_count = 0
+    skipped_count = 0
+
+    with fitz.open(cfg.input_pdf) as document:
+        for block in iter_visual_marker_blocks(marker_payload):
+            marker_block_id = block["marker_block_id"]
+            if not marker_block_id:
+                skipped_count += 1
+                continue
+
+            bbox = clean_bbox(block.get("bbox"))
+            if bbox is None:
+                skipped_count += 1
+                continue
+
+            page_num = int(block["page_num"])
+            page_index = page_num - 1
+            if page_index < 0 or page_index >= len(document):
+                skipped_count += 1
+                continue
+
+            page = document[page_index]
+            clip = fitz.Rect(*bbox) & page.rect
+            if clip.is_empty or clip.width <= 1 or clip.height <= 1:
+                skipped_count += 1
+                continue
+
+            safe_stem = slugify(marker_block_id)
+            asset_path = assets_root / f"page_{page_num:04d}_{safe_stem}.png"
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip, alpha=False)
+            pixmap.save(asset_path)
+            exported_count += 1
+
+            asset = {
+                "asset_id": f"{cfg.doc_id}_image_{exported_count:05d}",
+                "marker_block_id": marker_block_id,
+                "source_block_type": block["source_block_type"],
+                "path": str(asset_path),
+                "mime_type": "image/png",
+                "page_start": page_num,
+                "page_end": page_num,
+                "bbox": bbox,
+                "polygon": block.get("polygon"),
+                "width_px": int(pixmap.width),
+                "height_px": int(pixmap.height),
+                "sha256": sha256_file(asset_path),
+            }
+            assets_by_marker_id.setdefault(marker_block_id, []).append(asset)
+
+    manifest = {
+        "enabled": True,
+        "root": str(assets_root),
+        "exported_count": exported_count,
+        "skipped_count": skipped_count,
+    }
+    return assets_by_marker_id, manifest
+
+
 def extract_pages_and_metadata(payload: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)], {}
@@ -1355,6 +1475,8 @@ def flatten_blocks(page_block: dict[str, Any]) -> list[dict[str, Any]]:
                     "id": node.get("id"),
                     "block_type": block_type,
                     "html": node.get("html") or "",
+                    "bbox": copy.deepcopy(node.get("bbox")),
+                    "polygon": copy.deepcopy(node.get("polygon")),
                     "section_hierarchy": copy.deepcopy(node.get("section_hierarchy") or {}),
                     "children_count": len(children) if isinstance(children, list) else 0,
                 }
@@ -1428,7 +1550,10 @@ def classify_semantic_hint(block_type: str, heading_path: list[str], text: str) 
     return "section"
 
 
-def flatten_marker_json_to_normalized_blocks(payload: Any) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def flatten_marker_json_to_normalized_blocks(
+    payload: Any,
+    media_assets_by_marker_id: dict[str, list[dict[str, Any]]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     pages, metadata = extract_pages_and_metadata(payload)
     flat_blocks: list[dict[str, Any]] = []
     for page in pages:
@@ -1456,23 +1581,27 @@ def flatten_marker_json_to_normalized_blocks(payload: Any) -> tuple[list[dict[st
         heading_path = heading_path_for_block(block, section_lookup)
         semantic_hint = classify_semantic_hint(block_type, heading_path, display_text)
         indexable = semantic_hint != "front_matter"
+        marker_block_id = str(block["id"] or "")
+        media_assets = list((media_assets_by_marker_id or {}).get(marker_block_id) or [])
 
         counter += 1
-        normalized_blocks.append(
-            {
-                "block_order": counter,
-                "block_id": f"block_{counter:05d}",
-                "marker_block_id": block["id"],
-                "source_block_type": block_type,
-                "semantic_hint": semantic_hint,
-                "heading_path": heading_path,
-                "display_text": display_text,
-                "search_text": normalize_search_text(display_text),
-                "page_start": block["page_num"],
-                "page_end": block["page_num"],
-                "indexable": indexable,
-            }
-        )
+        normalized_block = {
+            "block_order": counter,
+            "block_id": f"block_{counter:05d}",
+            "marker_block_id": block["id"],
+            "source_block_type": block_type,
+            "semantic_hint": semantic_hint,
+            "heading_path": heading_path,
+            "display_text": display_text,
+            "search_text": normalize_search_text(display_text),
+            "page_start": block["page_num"],
+            "page_end": block["page_num"],
+            "indexable": indexable,
+        }
+        if media_assets:
+            normalized_block["media_assets"] = media_assets
+            normalized_block["has_image"] = True
+        normalized_blocks.append(normalized_block)
 
     return normalized_blocks, metadata
 
@@ -1602,25 +1731,28 @@ def build_structural_chunks(doc_id: str, normalized_blocks: list[dict[str, Any]]
     for block in normalized_blocks:
         semantic_hint = block["semantic_hint"]
         standalone = semantic_hint in {"table", "figure", "picture", "caption", "code", "list"}
+        block_media_assets = list(block.get("media_assets") or [])
         if standalone:
             flush_accumulator()
             counter += 1
-            chunks.append(
-                {
-                    "chunk_order": counter,
-                    "chunk_id": f"{doc_id}_chunk_{counter:05d}",
-                    "chunk_type": semantic_hint if semantic_hint in {"table", "list"} else "section",
-                    "semantic_hint": semantic_hint,
-                    "heading_path": block["heading_path"],
-                    "display_text": block["display_text"],
-                    "search_text": block["search_text"],
-                    "page_start": block["page_start"],
-                    "page_end": block["page_end"],
-                    "indexable": block["indexable"],
-                    "source_block_ids": [block["block_id"]],
-                    "source_marker_block_ids": [block["marker_block_id"]] if block["marker_block_id"] else [],
-                }
-            )
+            chunk = {
+                "chunk_order": counter,
+                "chunk_id": f"{doc_id}_chunk_{counter:05d}",
+                "chunk_type": semantic_hint if semantic_hint in {"table", "list"} else "section",
+                "semantic_hint": semantic_hint,
+                "heading_path": block["heading_path"],
+                "display_text": block["display_text"],
+                "search_text": block["search_text"],
+                "page_start": block["page_start"],
+                "page_end": block["page_end"],
+                "indexable": block["indexable"],
+                "source_block_ids": [block["block_id"]],
+                "source_marker_block_ids": [block["marker_block_id"]] if block["marker_block_id"] else [],
+                "has_image": bool(block_media_assets),
+            }
+            if block_media_assets:
+                chunk["media_assets"] = block_media_assets
+            chunks.append(chunk)
             continue
 
         chunk_type = (
@@ -1649,6 +1781,8 @@ def build_structural_chunks(doc_id: str, normalized_blocks: list[dict[str, Any]]
                 "indexable": block["indexable"],
                 "source_block_ids": [block["block_id"]],
                 "source_marker_block_ids": [block["marker_block_id"]] if block["marker_block_id"] else [],
+                "media_assets": block_media_assets,
+                "has_image": bool(block_media_assets),
             }
             continue
 
@@ -1660,10 +1794,16 @@ def build_structural_chunks(doc_id: str, normalized_blocks: list[dict[str, Any]]
         accumulator["source_block_ids"].append(block["block_id"])
         if block["marker_block_id"]:
             accumulator["source_marker_block_ids"].append(block["marker_block_id"])
+        if block_media_assets:
+            accumulator.setdefault("media_assets", []).extend(block_media_assets)
+            accumulator["has_image"] = True
 
     flush_accumulator()
     for chunk in chunks:
         chunk.pop("_group_key", None)
+        if not chunk.get("media_assets"):
+            chunk.pop("media_assets", None)
+            chunk["has_image"] = False
     return chunks
 
 
@@ -1697,6 +1837,7 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
     base_output = ensure_dir(cfg.output_root)
     manifests_dir = ensure_dir(base_output / "manifests")
     marker_raw_dir = ensure_dir(base_output / "marker_raw" / cfg.doc_id)
+    image_assets_dir = base_output / "image_assets" / cfg.doc_id
     normalized_dir = ensure_dir(base_output / "normalized_blocks")
     chunks_dir = ensure_dir(base_output / "structural_chunks")
 
@@ -1712,6 +1853,13 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
     json_command: str | None = None
     json_render_meta: dict[str, Any] = {"segmented": False}
     marker_metadata: dict[str, Any] = {}
+    image_asset_manifest: dict[str, Any] = {
+        "enabled": cfg.export_image_assets,
+        "root": str(image_assets_dir),
+        "exported_count": 0,
+        "skipped_count": 0,
+    }
+    media_assets_by_marker_id: dict[str, list[dict[str, Any]]] = {}
 
     print("[phase01] Normalizing markdown output...", file=sys.stderr, flush=True)
     fallback_markdown = markdown_artifact.read_text(encoding="utf-8")
@@ -1727,7 +1875,17 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
         )
         print("[phase01] Normalizing Marker JSON output...", file=sys.stderr, flush=True)
         marker_payload = read_json(json_artifact)
-        json_normalized_blocks, marker_metadata = flatten_marker_json_to_normalized_blocks(marker_payload)
+        if cfg.export_image_assets:
+            print("[phase01] Exporting image assets from Marker block geometry...", file=sys.stderr, flush=True)
+            media_assets_by_marker_id, image_asset_manifest = export_marker_image_assets(
+                cfg=cfg,
+                marker_payload=marker_payload,
+                assets_root=image_assets_dir,
+            )
+        json_normalized_blocks, marker_metadata = flatten_marker_json_to_normalized_blocks(
+            marker_payload,
+            media_assets_by_marker_id=media_assets_by_marker_id,
+        )
         if json_normalized_blocks:
             normalized_blocks = json_normalized_blocks
             normalized_source = "json"
@@ -1798,16 +1956,21 @@ def run_pipeline(cfg: PipelineConfig) -> dict[str, Any]:
             "markdown_segment_manifest": markdown_render_meta.get("segment_manifest"),
             "json_segment_manifest": json_render_meta.get("segment_manifest"),
             "debug": cfg.debug,
+            "export_image_assets": cfg.export_image_assets,
         },
         "artifacts": {
             "normalized_blocks": str(normalized_path),
             "structural_chunks": str(structural_chunks_path),
+            "image_assets": str(image_assets_dir) if cfg.export_image_assets else None,
         },
         "stats": {
             "normalized_block_count": len(normalized_blocks),
             "structural_chunk_count": len(structural_chunks),
             "indexable_chunk_count": sum(1 for chunk in structural_chunks if chunk["indexable"]),
+            "image_asset_count": int(image_asset_manifest.get("exported_count") or 0),
+            "image_asset_skipped_count": int(image_asset_manifest.get("skipped_count") or 0),
         },
+        "image_assets": image_asset_manifest,
         "marker_metadata": marker_metadata,
     }
     print("[phase01] Writing manifest and chunk artifacts...", file=sys.stderr, flush=True)
